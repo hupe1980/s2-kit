@@ -1,0 +1,5 @@
+{
+  "message_type": "HandshakeResponse",
+  "message_id": "7b0943cb-9b8d-45dc-bd80-83c20b4371ef",
+  "selected_protocol_version": "0.0.2-beta"
+}

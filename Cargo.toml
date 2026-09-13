@@ -1,0 +1,216 @@
+[package]
+name         = "s2-kit"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.94"
+authors      = ["hupe1980"]
+license      = "MIT OR Apache-2.0"
+description  = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: the S2 JSON data model, a semantic validator, sans-IO Resource Manager and Customer Energy Manager session engines, and S2 Connect"
+repository   = "https://github.com/hupe1980/s2-kit"
+homepage     = "https://hupe1980.github.io/s2-kit"
+documentation = "https://docs.rs/s2-kit"
+readme       = "README.md"
+keywords     = ["s2", "energy", "flexibility", "en50491", "smart-grid"]
+categories   = ["api-bindings", "encoding", "embedded", "network-programming"]
+# `/site` is published at the `documentation` URL and nothing in the crate reads it. The
+# vendored schemas stay: the tests validate against them.
+exclude      = ["/concepts", "/specs", "/fuzz", "/.github", "/site"]
+
+[features]
+default = ["std", "uuid", "tls-ring"]
+
+# The standard library. Without it the crate is `no_std + alloc`.
+std = ["serde/std", "serde_json/std", "thiserror/std", "bon/std", "uuid?/std", "dep:rand"]
+
+# Identifier generation (UUIDv4 / UUIDv7). Without it the application supplies every id.
+uuid = ["dep:uuid"]
+
+# Timestamp conversions to and from the common time crates.
+jiff = ["dep:jiff"]
+time = ["dep:time"]
+chrono = ["dep:chrono"]
+
+# Derive JSON Schema from the Rust types, for the structural-equivalence check.
+schemars = ["dep:schemars", "std"]
+
+# Async drivers.
+tokio = ["std", "testing", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+
+# S2 Connect.
+connect-client = ["std", "tokio", "dep:reqwest", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-platform-verifier", "dep:url"]
+connect-server = ["std", "tokio", "dep:axum", "dep:tower", "dep:http", "dep:rcgen", "dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:if-addrs"]
+discovery = ["std", "dep:mdns-sd"]
+
+# The bundled TLS cryptography. Neither is required: an application that installs its own
+# `rustls` provider needs no provider feature at all. `ring` cross-compiles without cmake;
+# `aws-lc-rs` is rustls's default, FIPS-certifiable and post-quantum (D33).
+tls-ring = ["rustls?/ring", "tokio-rustls?/ring", "rcgen?/ring"]
+tls-aws-lc-rs = ["rustls?/aws-lc-rs", "tokio-rustls?/aws-lc-rs", "rcgen?/aws_lc_rs"]
+
+# Test harness: fixtures, the two-engine `Conversation`, the in-memory pipe, and `.s2log`
+# transcripts read as well as written.
+testing = ["std"]
+
+# Structured logging from the drivers.
+tracing = ["dep:tracing"]
+
+# The `s2-kit` command line tool. `testing` carries the transcript reader `replay` needs.
+cli = ["std", "testing", "dep:clap", "dep:anyhow"]
+
+[dependencies]
+serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"] }
+# `float_roundtrip` is not a default and this crate needs it: the fast parser does not
+# round-trip an S2 fill rate (D16).
+serde_json = { version = "1.0.151", default-features = false, features = ["alloc", "float_roundtrip"] }
+thiserror = { version = "2.0.20", default-features = false }
+bon = { version = "3.10.1", default-features = false, features = ["alloc"] }
+
+uuid = { version = "1.26.1", default-features = false, features = ["v4", "v7", "serde"], optional = true }
+rand = { version = "0.10.2", optional = true }
+
+jiff = { version = "0.2.37", default-features = false, features = ["alloc"], optional = true }
+time = { version = "0.3.55", default-features = false, optional = true }
+chrono = { version = "0.4.45", default-features = false, optional = true }
+
+schemars = { version = "1.2.2", optional = true }
+
+tokio = { version = "1.53.1", features = ["rt", "time", "macros", "sync", "net"], optional = true }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"], optional = true }
+
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"], optional = true }
+rustls = { version = "0.23.44", default-features = false, features = ["std", "tls12"], optional = true }
+rustls-pki-types = { version = "1.15.1", optional = true }
+rustls-platform-verifier = { version = "0.7.0", optional = true }
+url = { version = "2.5.8", optional = true }
+
+axum = { version = "0.8.9", features = ["ws"], optional = true }
+hyper = { version = "1.11.1", features = ["server", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio"], optional = true }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["tls12"], optional = true }
+tower-service = { version = "0.3.3", optional = true }
+tower = { version = "0.5.3", optional = true }
+http = { version = "1.4.0", optional = true }
+# No default features: `rcgen`'s own `default` pulls `ring` in whichever provider is picked.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"], optional = true }
+
+mdns-sd = { version = "0.21.3", optional = true }
+# The same-subnet check the LAN-only operations require; also what `mdns-sd` uses.
+if-addrs = { version = "0.15.0", optional = true }
+
+# The pairing challenge–response. All `no_std`-capable, so `connect::proto` is too.
+hmac = { version = "0.13.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+subtle = { version = "2.6.1", default-features = false }
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc", "derive"] }
+
+tracing = { version = "0.1.44", default-features = false, optional = true }
+clap = { version = "4.6.0", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order"] }
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
+jsonschema = "0.56.0"
+schemars = "1.2.2"
+criterion = { version = "0.8.0", features = ["html_reports"] }
+# `tests/properties.rs`.
+proptest = "1.11.0"
+
+# Integration tests declare what they need so `cargo test --no-default-features` skips what
+# cannot run instead of failing to compile it. `uuid` appears wherever a test uses a
+# builder: `message_id` defaults to a fresh identifier only when `uuid` is on.
+[[test]]
+name = "conversations"
+required-features = ["testing", "uuid"]
+
+[[test]]
+name = "deadlines"
+required-features = ["testing", "uuid"]
+
+[[test]]
+name = "rule_coverage"
+required-features = ["testing", "uuid"]
+
+[[test]]
+name = "properties"
+required-features = ["testing", "uuid"]
+
+[[test]]
+name = "official_examples"
+required-features = ["std", "uuid"]
+
+[[test]]
+name = "model_matches_schema"
+required-features = ["std", "uuid"]
+
+[[test]]
+name = "connect_e2e"
+required-features = ["connect-client", "connect-server"]
+
+[[test]]
+name = "vendoring"
+required-features = ["std"]
+
+# Every example drives two engines through the in-memory pipe, so every example needs
+# `testing`.
+[[example]]
+name = "battery_rm"
+required-features = ["testing"]
+
+[[example]]
+name = "pv_rm"
+required-features = ["testing"]
+
+[[example]]
+name = "minimal_cem"
+required-features = ["testing"]
+
+[[example]]
+name = "proxy"
+required-features = ["testing"]
+
+[[example]]
+name = "connect_pair"
+required-features = ["connect-client", "connect-server"]
+
+[[bin]]
+name = "s2-kit"
+path = "src/bin/s2_kit.rs"
+required-features = ["cli"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+result_large_err = "allow"
+
+[profile.release]
+lto = "thin"
+
+[workspace]
+members = ["xtask"]
+
+[[bench]]
+name = "s2"
+harness = false
+required-features = ["testing"]

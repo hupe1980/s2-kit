@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en" prefix="og: https://ogp.me/ns#">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Every page needs its own title and description. A site where they are all the site
+    default is a site where search results are 83 identical rows, and where a link posted
+    in a chat says nothing about what was linked. `page` is set on pages, `section` on
+    sections, and neither on nothing. -#}
+{%- set this = page | default(value=section) | default(value=false) -%}
+{%- set page_title = this.title | default(value=config.title) -%}
+{%- set page_desc = this.description | default(value=config.description) -%}
+{%- set page_url = this.permalink | default(value=config.base_url) -%}
+{%- set is_home = page_url == config.base_url ~ "/" or page_url == config.base_url -%}
+
+<title>{% if is_home %}{{ config.title }} — {{ config.extra.tagline }}{% else %}{{ page_title }} · {{ config.title }}{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ page_url | safe }}">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ page_url | safe }}">
+<meta property="og:locale" content="en">
+{# No social image to point at, so the small card is the honest one. #}
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+
+<meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="light dark">
+
+<link rel="stylesheet" href="{{ get_url(path='main.css', trailing_slash=false) | safe }}">
+{%- if config.generate_feeds %}
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml', trailing_slash=false) | safe }}">
+{%- endif %}
+
+{# Structured data: what this page is, in the vocabulary a search engine parses. #}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "{{ config.title }}",
+  "description": "{{ config.description }}",
+  "url": "{{ config.base_url | safe }}",
+  "codeRepository": "{{ config.extra.repository }}",
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/Apache-2.0.html",
+  "author": { "@type": "Person", "name": "{{ config.author }}" },
+  "about": {
+    "@type": "Thing",
+    "name": "S2 energy flexibility standard (EN 50491-12-2)",
+    "url": "{{ config.extra.standard }}"
+  }
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="topbar">
+  <nav aria-label="Primary">
+    <a class="brand" href="{{ get_url(path='@/_index.md') | safe }}">
+      <span class="mark" aria-hidden="true">S2</span> {{ config.title }}
+    </a>
+    <ul>
+      <li><a href="{{ get_url(path='@/docs/_index.md') | safe }}">Guide</a></li>
+      <li><a href="{{ get_url(path='@/reference/_index.md') | safe }}">Reference</a></li>
+      <li><a href="{{ config.extra.api_docs }}" rel="external">API</a></li>
+      <li><a href="{{ config.extra.repository }}" rel="external">GitHub</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main id="content">
+{% block content %}{% endblock content %}
+</main>
+
+<footer class="footer">
+  <p>
+    <strong>{{ config.title }}</strong> — {{ config.extra.tagline }}
+    Licensed under <a href="{{ config.extra.repository }}/blob/main/LICENSE-APACHE">Apache-2.0</a>
+    or <a href="{{ config.extra.repository }}/blob/main/LICENSE-MIT">MIT</a>.
+  </p>
+  <p class="muted">
+    Not affiliated with or endorsed by the FlexiblePower Alliance Network.
+    S2 is specified at <a href="{{ config.extra.standard }}" rel="external">docs.s2standard.org</a>.
+  </p>
+</footer>
+</body>
+</html>

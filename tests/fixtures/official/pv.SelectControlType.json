@@ -1,0 +1,5 @@
+{
+  "message_type": "SelectControlType",
+  "message_id": "xxx",
+  "control_type": "POWER_ENVELOPE_BASED_CONTROL"
+}

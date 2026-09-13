@@ -1,0 +1,13 @@
++++
+title = "ID"
+description = "Unique identifier for many S2 objects."
+[extra]
+generated = true
++++
+
+Unique identifier for many S2 objects.
+
+`ID` is a string that represents a unique identifier. Almost all S2 messages carry a `message_id`, and many objects (such as `OMBC.OperationMode`) carry an `id` as well to easily refer to them.
+
+It's highly recommended to use a UUID for this; while the S2 specification allows for different options, UUIDs are widely supported and fulfill all the requirements. If you use JSON to encode S2 messages, you must use UUIDs for `ID`.
+

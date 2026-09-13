@@ -1,0 +1,60 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Nightly, long enough to be worth the machine time and short enough to finish.
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes per target"
+        default: "10"
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The S2 JSON targets start from the standard's own 43 worked examples rather
+          # than from nothing, so a run mutates messages that already parse. The seed
+          # directory is read-only; libFuzzer writes finds to the first path.
+          - target: decode
+            seeds: tests/fixtures/official
+          - target: roundtrip
+            seeds: tests/fixtures/official
+          - target: validate
+            seeds: tests/fixtures/official
+          # These take short strings and opaque bodies; a message fixture is no help.
+          - target: id_parse
+            seeds: ""
+          - target: timestamp_parse
+            seeds: ""
+          - target: connect_bodies
+            seeds: ""
+          - target: pairing_code
+            seeds: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          seconds=$(( ${{ github.event.inputs.minutes || '10' }} * 60 ))
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          # A hang or a runaway allocation is a reported failure, not a job GitHub kills.
+          cargo fuzz run "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" ${{ matrix.seeds }} -- \
+            -max_total_time="$seconds" -timeout=25 -rss_limit_mb=4096
+      - name: Upload any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts

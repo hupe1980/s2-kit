@@ -1,0 +1,47 @@
+# `cargo deny` configuration. The point of this file is that a dependency cannot be added
+# to an energy-control library without someone noticing its licence and its advisories.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive only. A copyleft dependency in a library that vendors into embedded firmware
+# is a licensing problem for every consumer, not just for us.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # The Mozilla CA certificate set that `webpki-roots` ships. CDLA-Permissive-2.0 is a
+    # *data* licence — the roots are data, not code — and it is permissive with no
+    # copyleft and no obligation passed to downstream users of this crate.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing in this crate should pull in a second async runtime or a second TLS stack.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "async-std" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

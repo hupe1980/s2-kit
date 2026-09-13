@@ -1,0 +1,35 @@
+# Zola configuration. `zola serve` to preview, `zola build` to render into `public/`.
+base_url = "https://hupe1980.github.io/s2-kit"
+title = "s2-kit"
+description = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: a proven data model, a 61-rule semantic validator, sans-I/O session engines for both roles, and S2 Connect end to end."
+author = "Frank Hübner"
+
+compile_sass = true
+minify_html = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+# Every page ends up in the sitemap Zola writes; the search index powers the docs filter.
+[search]
+index_format = "elasticlunr_json"
+
+[markdown.highlighting]
+# Two themes so code follows the reader's light/dark preference rather than fighting it.
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+
+[markdown]
+smart_punctuation = true
+render_emoji = false
+# Anchors on every heading: a documentation page nobody can link *into* is a page people
+# screenshot instead of citing.
+insert_anchor_links = "heading"
+
+[extra]
+repository = "https://github.com/hupe1980/s2-kit"
+crate = "https://crates.io/crates/s2-kit"
+api_docs = "https://docs.rs/s2-kit"
+standard = "https://docs.s2standard.org/"
+tagline = "The S2 energy flexibility standard, in Rust."

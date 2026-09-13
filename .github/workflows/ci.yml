@@ -1,0 +1,249 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Once a week, so an advisory in a dependency surfaces before a release does.
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          # The MSRV the manifest claims. If this job fails, either the code or the
+          # claim is wrong; both are bugs.
+          - os: ubuntu-latest
+            rust: "1.94"
+          - os: ubuntu-latest
+            rust: beta
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+      # The integration tests need `testing`, so `no_std` runs the unit tests only —
+      # still a majority of them, exercising the core without the standard library.
+      - run: cargo test --lib --no-default-features
+      # The middle configuration: `std` and `uuid`, no drivers. `testing` is added
+      # because the integration tests are written against it — without it this job
+      # compiled nothing and reported success for it.
+      - run: cargo test --features std,testing
+
+  # The engines are meant to run on a controller with no operating system. A crate that
+  # only claims `no_std` is a crate that is not `no_std`, so we build for a target that
+  # has no `std` at all.
+  embedded:
+    name: no_std (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [thumbv7em-none-eabihf, riscv32imac-unknown-none-elf]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # Without `uuid`: on a target with no operating system, `getrandom` has no backend
+      # to pick and the choice belongs to the firmware, not to this crate. The
+      # application supplies every identifier there.
+      - run: cargo build --no-default-features --target ${{ matrix.target }}
+
+  wasm:
+    name: wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Same reason as the embedded job: `getrandom` on `wasm32-unknown-unknown` needs a
+      # backend chosen by the application.
+      - run: cargo build --no-default-features --target wasm32-unknown-unknown
+
+  lint:
+    name: clippy + rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-features --all-targets
+      - run: cargo clippy --no-default-features
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Every public item is documented and every intra-doc link resolves, or the build
+      # fails. `docsrs` is what turns on the feature badges docs.rs renders.
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links --cfg docsrs"
+
+  # The TLS provider is a feature, and an alternative nobody builds is an alternative that
+  # has already broken. This runs the whole S2 Connect end-to-end suite — real TLS on
+  # loopback, real certificates — against `aws-lc-rs` instead of the default `ring`, and
+  # asserts that each build carries exactly one crypto provider rather than both.
+  tls-provider:
+    name: TLS provider (aws-lc-rs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with aws-lc-rs
+        run: >
+          cargo test --no-default-features
+          --features std,uuid,testing,connect-client,connect-server,tls-aws-lc-rs
+      - name: Exactly one provider per build
+        run: |
+          set -eu
+          # `cargo tree -i` exits 0 with a warning when the package is absent, so the
+          # output is what decides, not the status.
+          has() {
+            cargo tree --no-default-features --features "$1" -e normal -i "$2" 2>/dev/null \
+              | grep -qE "^$2 v"
+          }
+          check() {
+            features="$1"; want="$2"; unwanted="$3"
+            has "$features" "$want" \
+              || { echo "::error::$want missing from a build that selected it ($features)"; exit 1; }
+            ! has "$features" "$unwanted" \
+              || { echo "::error::$unwanted linked into a build that did not ask for it ($features)"; exit 1; }
+            echo "$features -> $want only"
+          }
+          check std,uuid,connect-client,connect-server,tls-ring ring aws-lc-rs
+          check std,uuid,connect-client,connect-server,tls-aws-lc-rs aws-lc-rs ring
+
+  # Features are not a matrix of two: fifteen of them are 32 768 combinations, and the
+  # ones that fail to compile are always the ones nobody tried. `cargo hack` tries them.
+  features:
+    name: feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo hack check --feature-powerset --depth 2 --no-dev-deps
+
+  # The generated files — the schema table, docs/RULES.md, the model reference — are
+  # checked in so a reader of the repository can see them. This job proves they are what
+  # the generator would produce today.
+  generated:
+    name: generated files are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # All three repositories: `vendor-specs` needs the schemas, and
+      # `gen-model-reference` and `check-docs` need the standard's own field documentation.
+      - name: Clone the specifications
+        run: |
+          git clone --quiet https://github.com/flexiblepower/s2-json specs/s2-json
+          git clone --quiet https://github.com/flexiblepower/s2-connect specs/s2-connect
+          git clone --quiet https://github.com/flexiblepower/s2-documentation specs/s2-documentation
+      - run: cargo xtask vendor-specs
+      - run: cargo xtask all
+      # By name as well: `all` skips these two when the specs are absent, so only running
+      # them directly turns a broken clone into a failure rather than a quiet pass.
+      - run: cargo xtask gen-model-reference
+      - run: cargo xtask check-docs
+      - name: Fail if anything is stale
+        run: |
+          if ! git diff --exit-code -- . ':!specs'; then
+            echo "::error::Generated or vendored files are out of date."
+            echo "::error::Run 'cargo xtask vendor-specs && cargo xtask all' and commit."
+            exit 1
+          fi
+
+  # Every example in the README and in the documentation must actually run; an example
+  # that only compiles is an example that has already drifted.
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --example battery_rm --all-features
+      - run: cargo run --example pv_rm --all-features
+      - run: cargo run --example minimal_cem --all-features
+      - run: cargo run --example proxy --all-features
+      # The only example that opens a socket, and the only one that runs the whole of
+      # S2 Connect: pairing over real TLS, session initiation, and an authorised
+      # WebSocket carrying a session between two engines.
+      - run: cargo run --example connect_pair --all-features
+
+  # The website must build, and its internal links must resolve. `zola check` also walks
+  # external links, which makes it a slow and flaky gate — so the build is the gate and
+  # the link walk is not.
+  site:
+    name: website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Zola
+        run: |
+          curl -sSL https://github.com/getzola/zola/releases/download/v0.23.4/zola-v0.23.4-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C /usr/local/bin zola
+      - run: zola --root site build
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # `-D warnings` hides nothing, but a panic hidden behind a rare branch does. Miri is
+  # not useful here (the crate forbids unsafe), so the coverage gate is the one that
+  # catches an unexercised path.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

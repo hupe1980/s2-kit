@@ -1,0 +1,5 @@
+{
+  "message_type": "FRBC.StorageStatus",
+  "message_id": "string",
+  "present_fill_level": 0
+}

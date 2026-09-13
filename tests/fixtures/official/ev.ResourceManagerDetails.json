@@ -1,0 +1,24 @@
+{
+  "message_type": "ResourceManagerDetails",
+  "message_id": "0c41efc2-771d-468f-afdc-fb69255dad33",
+  "resource_id": "acme_ev_xxxxxx",
+  "name": "My Electric Vehicle RM",
+  "roles": [
+    {
+      "role": "ENERGY_CONSUMER",
+      "commodity": "ELECTRICITY"
+    }
+  ],
+  "manufacturer": "ACME",
+  "model": "WallBox-b100",
+  "serial_number": "123",
+  "firmware_version": "v1.0",
+  "instruction_processing_delay": 3000,
+  "available_control_types": [
+    "FILL_RATE_BASED_CONTROL"
+  ],
+  "provides_forecast": false,
+  "provides_power_measurement_types": [
+    "ELECTRIC.POWER.3_PHASE_SYMMETRIC"
+  ]
+}

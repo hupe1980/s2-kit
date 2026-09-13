@@ -1,0 +1,24 @@
+{
+  "message_type": "ResourceManagerDetails",
+  "message_id": "a348da35-eb0c-456c-9099-cdcc22e030a0",
+  "resource_id": "acme_heat_pump",
+  "name": "my_heat_pump",
+  "roles": [
+    {
+      "role": "ENERGY_CONSUMER",
+      "commodity": "ELECTRICITY"
+    }
+  ],
+  "manufacturer": "ACME",
+  "model": "HeatPump2000",
+  "serial_number": "123",
+  "firmware_version": "v1.0",
+  "instruction_processing_delay": 10000,
+  "available_control_types": [
+    "FILL_RATE_BASED_CONTROL"
+  ],
+  "provides_forecast": false,
+  "provides_power_measurement_types": [
+    "ELECTRIC.POWER.L1"
+  ]
+}

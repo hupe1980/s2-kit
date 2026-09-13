@@ -1,0 +1,6 @@
+{
+  "message_type": "SessionRequest",
+  "message_id": "1d509406-816c-4ce3-a034-ce88a684116c",
+  "request": "TERMINATE",
+  "diagnostic_label": "string"
+}

@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Package and verify, but do not publish"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+# A publish cannot be undone and a version cannot be reused, so two runs must never race.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything CI proves, proved again on the exact commit being published — a tag can be
+  # pushed at a commit CI never ran on.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag is the claim; `Cargo.toml` is the fact. Publishing when they disagree
+      # yields a release whose git tag points at a different version than crates.io holds.
+      - id: version
+        name: The tag and the manifest must agree
+        run: |
+          set -eu
+          # By name: `--no-deps` lists every workspace member, and `xtask` sorts first.
+          manifest=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          packages = json.load(sys.stdin)["packages"]
+          print(next(p["version"] for p in packages if p["name"] == "s2-kit"))')
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            [ "$tag" = "$manifest" ] || {
+              echo "::error::tag v$tag does not match Cargo.toml version $manifest"
+              exit 1
+            }
+          fi
+          echo "publishing s2-kit $manifest"
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-features --all-targets
+      - run: cargo clippy --no-default-features
+      - run: cargo test --all-features
+      - run: cargo test --lib --no-default-features
+
+      # What goes in the `.crate` is not what is in the working tree: `exclude` drops
+      # `/concepts`, `/site`, `/fuzz` and `/.github`, and the vendored schemas stay because
+      # the tests read them. `--locked` refuses to quietly update a dependency on the way.
+      - run: cargo package --all-features --locked
+      - name: The packaged crate carries its licences and its schemas
+        run: |
+          set -eu
+          crate=$(ls target/package/s2-kit-*.crate)
+          echo "$crate: $(du -h "$crate" | cut -f1)"
+          for required in LICENSE-MIT LICENSE-APACHE README.md CHANGELOG.md \
+                          schema/s2-json/LICENSE; do
+            tar tzf "$crate" | grep -q "/$required\$" || {
+              echo "::error::$required is missing from the published crate"
+              exit 1
+            }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate
+          path: target/package/*.crate
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    if: github.event_name == 'push' || inputs.dry-run == false
+    runs-on: ubuntu-latest
+    # The token lives in an environment rather than in plain repository secrets, so a
+    # publish can require a review and a fork's workflow can never reach it.
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/s2-kit
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --all-features --locked
+
+  github-release:
+    name: GitHub release
+    needs: [verify, publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate
+          path: dist
+      # The section of CHANGELOG.md for this version, verbatim. A release whose notes are
+      # generated from commit subjects says what changed in the repository; the changelog
+      # says what changed for somebody depending on it.
+      - id: notes
+        run: |
+          set -eu
+          version="${{ needs.verify.outputs.version }}"
+          python3 - "$version" <<'EOF' > notes.md
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          # Up to the next section, or to the link definitions at the foot of the file.
+          match = re.search(
+              rf"^## \[{re.escape(version)}\].*?$(.*?)(?=^## |^\[|\Z)",
+              text, re.M | re.S)
+          print((match.group(1) if match else "").strip() or
+                f"See CHANGELOG.md for {version}.")
+          EOF
+          cat notes.md
+      # `gh` is preinstalled on the runner, so the one job that holds `contents: write`
+      # borrows nobody else's code to use it.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ls dist/*.crate
+          gh release create "$GITHUB_REF_NAME" dist/*.crate \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

@@ -1,0 +1,24 @@
+{
+  "message_type": "ResourceManagerDetails",
+  "message_id": "xxx",
+  "resource_id": "acme_pv_installation",
+  "name": "Solar panels on roof",
+  "roles": [
+    {
+      "role": "ENERGY_PRODUCER",
+      "commodity": "ELECTRICITY"
+    }
+  ],
+  "manufacturer": "ACME",
+  "model": "InverterType2024",
+  "serial_number": "123",
+  "firmware_version": "v1.0",
+  "instruction_processing_delay": 5000,
+  "available_control_types": [
+    "POWER_ENVELOPE_BASED_CONTROL"
+  ],
+  "provides_forecast": true,
+  "provides_power_measurement_types": [
+    "ELECTRIC.POWER.L1"
+  ]
+}

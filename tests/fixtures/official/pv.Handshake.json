@@ -1,0 +1,8 @@
+{
+  "message_type": "Handshake",
+  "message_id": "xxx",
+  "role": "RM",
+  "supported_protocol_versions": [
+    "0.0.2-beta"
+  ]
+}

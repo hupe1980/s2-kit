@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="prose">
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="{{ get_url(path='@/_index.md') | safe }}">Home</a>
+    {%- if page.ancestors %}
+    {%- set parent = get_section(path=page.ancestors | last) %}
+    <span aria-hidden="true">/</span> <a href="{{ parent.permalink | safe }}">{{ parent.title }}</a>
+    {%- endif %}
+  </nav>
+
+  <h1>{{ page.title }}</h1>
+  {%- if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
+  {%- if page.extra.generated %}
+  <p class="note" role="note">
+    This page is generated from the crate itself, so it cannot disagree with the code.
+  </p>
+  {%- endif %}
+
+  {%- if page.toc | length > 2 %}
+  <details class="toc">
+    <summary>On this page</summary>
+    <ul>
+      {%- for h in page.toc %}
+      <li><a href="{{ h.permalink | safe }}">{{ h.title }}</a></li>
+      {%- endfor %}
+    </ul>
+  </details>
+  {%- endif %}
+
+  {{ page.content | safe }}
+</article>
+{% endblock content %}

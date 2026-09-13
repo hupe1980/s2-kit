@@ -1,0 +1,7 @@
+{
+  "message_type": "InstructionStatusUpdate",
+  "message_id": "84522a12-7960-48b1-abf3-b7694dac80e6",
+  "instruction_id": "instruction1",
+  "status_type": "NEW",
+  "timestamp": "2019-08-24T14:15:22Z"
+}

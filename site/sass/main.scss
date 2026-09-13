@@ -1,0 +1,242 @@
+// One stylesheet, no JavaScript, no web fonts. A documentation site that needs a
+// framework to render a table is a documentation site that loads slowly on the rural
+// connection somebody's heat pump is behind.
+
+:root {
+  --bg: #ffffff;
+  --surface: #f6f8fa;
+  --border: #d8dee4;
+  --text: #1c2128;
+  --muted: #57606a;
+  --accent: #0a6b4d;
+  --accent-soft: #e6f4ee;
+  --code-bg: #f6f8fa;
+  --radius: 10px;
+  --measure: 42rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1220;
+    --surface: #131c2b;
+    --border: #263349;
+    --text: #dce3ec;
+    --muted: #93a1b5;
+    --accent: #4ade9f;
+    --accent-soft: #10291f;
+    --code-bg: #0f1828;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  text-rendering: optimizeLegibility;
+}
+
+code, pre, .mark {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+
+.skip {
+  position: absolute;
+  left: -9999px;
+  &:focus {
+    left: 1rem; top: 1rem; z-index: 10;
+    background: var(--accent); color: var(--bg);
+    padding: .5rem .75rem; border-radius: var(--radius);
+  }
+}
+
+// ---------------------------------------------------------------- chrome
+
+.topbar {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  position: sticky; top: 0; z-index: 5;
+
+  nav {
+    max-width: 68rem; margin: 0 auto; padding: .75rem 1.25rem;
+    display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;
+  }
+
+  ul {
+    list-style: none; display: flex; gap: 1.1rem;
+    margin: 0; padding: 0; margin-left: auto; flex-wrap: wrap;
+  }
+
+  a { color: var(--text); text-decoration: none; font-size: .95rem; }
+  a:hover { color: var(--accent); }
+}
+
+.brand {
+  font-weight: 650; display: inline-flex; align-items: center; gap: .55rem;
+  .mark {
+    background: var(--accent); color: var(--bg);
+    border-radius: 6px; padding: .1rem .4rem;
+    font-size: .8rem; font-weight: 700; letter-spacing: .02em;
+  }
+}
+
+.footer {
+  border-top: 1px solid var(--border);
+  margin-top: 4rem; padding: 2rem 1.25rem 3rem;
+  font-size: .9rem;
+  p { max-width: 68rem; margin: 0 auto .5rem; }
+  .muted { color: var(--muted); }
+}
+
+// ---------------------------------------------------------------- hero
+
+.hero {
+  max-width: 68rem; margin: 0 auto; padding: 4.5rem 1.25rem 2rem;
+
+  h1 {
+    font-size: clamp(2rem, 6vw, 3.4rem);
+    line-height: 1.12; letter-spacing: -.02em; margin: 0 0 1rem;
+  }
+  .accent { color: var(--accent); }
+}
+
+.lede {
+  font-size: 1.12rem; color: var(--muted);
+  max-width: var(--measure); margin: 0 0 1.75rem;
+}
+
+.cta { display: flex; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.75rem; }
+
+.button {
+  display: inline-block; padding: .6rem 1.1rem;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  text-decoration: none; color: var(--text); font-weight: 550;
+  &:hover { border-color: var(--accent); color: var(--accent); }
+  &.primary {
+    background: var(--accent); border-color: var(--accent); color: var(--bg);
+    &:hover { color: var(--bg); filter: brightness(1.08); }
+  }
+}
+
+.install {
+  display: inline-block; margin: 0;
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: .7rem 1rem;
+}
+
+// ---------------------------------------------------------------- prose
+
+.prose {
+  max-width: 68rem; margin: 0 auto; padding: 2.5rem 1.25rem;
+
+  > h1 { font-size: clamp(1.8rem, 4vw, 2.5rem); line-height: 1.15; margin: 0 0 .75rem; }
+  h2 { font-size: 1.45rem; margin: 2.5rem 0 .75rem; letter-spacing: -.01em; }
+  h3 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
+
+  p, ul, ol { max-width: var(--measure); }
+  li { margin: .3rem 0; }
+
+  blockquote {
+    margin: 1.25rem 0; padding: .35rem 0 .35rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--muted);
+    max-width: var(--measure);
+  }
+}
+
+.crumbs {
+  font-size: .88rem; color: var(--muted); margin-bottom: 1rem;
+  a { color: var(--muted); }
+}
+
+.note {
+  background: var(--accent-soft); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: .7rem 1rem;
+  font-size: .93rem; max-width: var(--measure);
+}
+
+.toc {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: .6rem 1rem; margin: 1.5rem 0; max-width: var(--measure);
+  summary { cursor: pointer; font-weight: 550; }
+  ul { margin: .6rem 0 .2rem; padding-left: 1.1rem; }
+  a { color: var(--text); }
+}
+
+// Anchors Zola inserts on headings: present, but not shouting.
+.zola-anchor {
+  color: var(--muted); text-decoration: none;
+  margin-left: .4rem; opacity: 0;
+  h2:hover &, h3:hover & { opacity: 1; }
+}
+
+// ---------------------------------------------------------------- code
+
+code {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 5px; padding: .08em .35em; font-size: .89em;
+}
+
+pre {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 1rem;
+  overflow-x: auto; font-size: .89rem; line-height: 1.55;
+  code { background: none; border: 0; padding: 0; font-size: inherit; }
+}
+
+// ---------------------------------------------------------------- tables
+
+// The reference pages are mostly tables, and some of them are wide. They scroll on their
+// own rather than making the whole page scroll sideways on a phone.
+table {
+  width: 100%; border-collapse: collapse; margin: 1.25rem 0;
+  font-size: .93rem; display: block; overflow-x: auto;
+}
+
+th, td {
+  border: 1px solid var(--border); padding: .5rem .7rem;
+  text-align: left; vertical-align: top;
+}
+
+th { background: var(--surface); font-weight: 600; white-space: nowrap; }
+tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface) 45%, transparent); }
+
+// ---------------------------------------------------------------- cards
+
+.cards {
+  display: grid; gap: 1rem; margin: 2rem 0;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+}
+
+.card {
+  display: block; text-decoration: none; color: inherit;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 1rem 1.1rem; background: var(--surface);
+  &:hover { border-color: var(--accent); }
+  h2 { margin: 0 0 .35rem; font-size: 1.05rem; color: var(--accent); }
+  p { margin: 0; color: var(--muted); font-size: .92rem; }
+}
+
+.grid {
+  display: grid; gap: 1.25rem; margin: 2.5rem 0;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  max-width: none;
+  > div {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 1.1rem 1.2rem; background: var(--surface);
+  }
+  h3 { margin-top: 0; }
+  p { max-width: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

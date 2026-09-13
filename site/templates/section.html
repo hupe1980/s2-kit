@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="prose">
+  <h1>{{ section.title }}</h1>
+  {%- if section.description %}<p class="lede">{{ section.description }}</p>{% endif %}
+  {{ section.content | safe }}
+
+  {# Zola has already ordered `pages` by the section's `sort_by`; re-sorting here would
+     only find the pages that happen to carry the attribute. #}
+  {%- if section.subsections or section.pages %}
+  <nav class="cards" aria-label="{{ section.title }} contents">
+    {%- for path in section.subsections %}
+    {%- set sub = get_section(path=path) %}
+    <a class="card" href="{{ sub.permalink | safe }}">
+      <h2>{{ sub.title }}</h2>
+      <p>{{ sub.description | default(value="") }}</p>
+    </a>
+    {%- endfor %}
+    {%- for p in section.pages %}
+    <a class="card" href="{{ p.permalink | safe }}">
+      <h2>{{ p.title }}</h2>
+      <p>{{ p.description | default(value="") }}</p>
+    </a>
+    {%- endfor %}
+  </nav>
+  {%- endif %}
+</article>
+{% endblock content %}

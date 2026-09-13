@@ -1,0 +1,8 @@
+{
+  "message_type": "Handshake",
+  "message_id": "4834583e-5d8a-4fb2-a955-c99fc4583b7a",
+  "role": "CEM",
+  "supported_protocol_versions": [
+    "0.0.2-beta"
+  ]
+}

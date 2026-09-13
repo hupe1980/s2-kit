@@ -1,0 +1,10 @@
+{
+  "message_type": "PEBC.EnergyConstraint",
+  "message_id": "xxx",
+  "id": "energyconstraint1",
+  "valid_from": "2024-12-24T14:15:22Z",
+  "valid_until": "2024-12-25T14:15:22Z",
+  "upper_average_power": 3000,
+  "lower_average_power": 1000,
+  "commodity_quantity": "ELECTRIC.POWER.L1"
+}

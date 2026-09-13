@@ -1,0 +1,125 @@
+{
+  "message_type": "FRBC.SystemDescription",
+  "message_id": "0f9063c5-ceb9-4ab9-8a4b-96b6d38dff8a",
+  "valid_from": "2019-08-24T14:15:22Z",
+  "actuators": [
+    {
+      "id": "actuator1",
+      "diagnostic_label": "heat pump",
+      "supported_commodities": [
+        "ELECTRICITY"
+      ],
+      "operation_modes": [
+        {
+          "id": "om0",
+          "diagnostic_label": "running",
+          "elements": [
+            {
+              "fill_level_range": {
+                "start_of_range": 45,
+                "end_of_range": 55
+              },
+              "fill_rate": {
+                "start_of_range": 0.00209,
+                "end_of_range": 0.00835
+              },
+              "power_ranges": [
+                {
+                  "start_of_range": 500,
+                  "end_of_range": 2000,
+                  "commodity_quantity": "ELECTRIC.POWER.L1"
+                }
+              ],
+              "running_costs": {
+                "start_of_range": 0,
+                "end_of_range": 0
+              }
+            }
+          ],
+          "abnormal_condition_only": false
+        },
+        {
+          "id": "om1",
+          "diagnostic_label": "Off",
+          "elements": [
+            {
+              "fill_level_range": {
+                "start_of_range": 45,
+                "end_of_range": 55
+              },
+              "fill_rate": {
+                "start_of_range": 0,
+                "end_of_range": 0
+              },
+              "power_ranges": [
+                {
+                  "start_of_range": 0,
+                  "end_of_range": 0,
+                  "commodity_quantity": "ELECTRIC.POWER.L1"
+                }
+              ],
+              "running_costs": {
+                "start_of_range": 0,
+                "end_of_range": 0
+              }
+            }
+          ],
+          "abnormal_condition_only": false
+        }
+      ],
+      "transitions": [
+        {
+          "id": "trans0",
+          "from": "om0",
+          "to": "om1",
+          "start_timers": [
+            "timer0"
+          ],
+          "blocking_timers": [
+            "timer1"
+          ],
+          "transition_costs": 0,
+          "transition_duration": 0,
+          "abnormal_condition_only": false
+        },
+        {
+          "id": "trans1",
+          "from": "om1",
+          "to": "om0",
+          "start_timers": [
+            "timer1"
+          ],
+          "blocking_timers": [
+            "timer0"
+          ],
+          "transition_costs": 0,
+          "transition_duration": 0,
+          "abnormal_condition_only": false
+        }
+      ],
+      "timers": [
+        {
+          "id": "timer0",
+          "diagnostic_label": "Minimum run time",
+          "duration": 7200
+        },
+        {
+          "id": "timer1",
+          "diagnostic_label": "Minimum off time",
+          "duration": 3600
+        }
+      ]
+    }
+  ],
+  "storage": {
+    "diagnostic_label": "DHW Buffer",
+    "fill_level_label": "temperature",
+    "provides_leakage_behaviour": true,
+    "provides_fill_level_target_profile": false,
+    "provides_usage_forecast": true,
+    "fill_level_range": {
+      "start_of_range": 45,
+      "end_of_range": 55
+    }
+  }
+}

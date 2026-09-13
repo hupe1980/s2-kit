@@ -1,0 +1,10 @@
+{
+  "message_type": "FRBC.Instruction",
+  "message_id": "795f10a7-2f5e-4052-90f6-832eecd33dad",
+  "id": "instr0",
+  "actuator_id": "actuator0",
+  "operation_mode": "om0",
+  "operation_mode_factor": 1,
+  "execution_time": "2019-08-24T14:15:22Z",
+  "abnormal_condition": false
+}

@@ -1,0 +1,11 @@
+{
+  "message_type": "PowerMeasurement",
+  "message_id": "8db515c2-1ee0-40bb-8820-15c5ddc4bbd3",
+  "measurement_timestamp": "2019-08-24T14:15:22Z",
+  "values": [
+    {
+      "commodity_quantity": "ELECTRIC.POWER.L1",
+      "value": 0
+    }
+  ]
+}

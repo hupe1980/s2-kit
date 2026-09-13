@@ -1,0 +1,6 @@
+{
+  "message_type": "SessionRequest",
+  "message_id": "xxx",
+  "request": "TERMINATE",
+  "diagnostic_label": "PV Inverter resource manager shutdown"
+}

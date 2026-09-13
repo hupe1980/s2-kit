@@ -1,0 +1,11 @@
+{
+  "message_type": "PowerMeasurement",
+  "message_id": "xxx",
+  "measurement_timestamp": "2024-08-24T14:15:22Z",
+  "values": [
+    {
+      "commodity_quantity": "ELECTRIC.POWER.L1",
+      "value": 3450.6
+    }
+  ]
+}

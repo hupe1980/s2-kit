@@ -1,0 +1,9 @@
+{
+  "message_type": "FRBC.ActuatorStatus",
+  "message_id": "2d553846-8023-45c4-8e6c-b0e161e60c34",
+  "actuator_id": "actuator0",
+  "active_operation_mode_id": "om0",
+  "operation_mode_factor": 0,
+  "previous_operation_mode_id": "om1",
+  "transition_timestamp": "2019-08-24T14:15:22Z"
+}

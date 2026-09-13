@@ -1,0 +1,24 @@
+{
+  "message_type": "ResourceManagerDetails",
+  "message_id": "ab44046a-2bd2-4115-b16c-985638166afa",
+  "resource_id": "acme_asset",
+  "name": "my_asset",
+  "roles": [
+    {
+      "role": "ENERGY_CONSUMER",
+      "commodity": "ELECTRICITY"
+    }
+  ],
+  "manufacturer": "ACME",
+  "model": "Asset-3000",
+  "serial_number": "123",
+  "firmware_version": "v1.0",
+  "instruction_processing_delay": 10000,
+  "available_control_types": [
+    "NOT_CONTROLABLE"
+  ],
+  "provides_forecast": true,
+  "provides_power_measurement_types": [
+    "ELECTRIC.POWER.L1"
+  ]
+}

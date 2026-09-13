@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <h1>The S2 energy flexibility standard,<br><span class="accent">in Rust</span>.</h1>
+  <p class="lede">{{ section.description }}</p>
+  <div class="cta">
+    <a class="button primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+    <a class="button" href="{{ config.extra.api_docs }}" rel="external">API documentation</a>
+  </div>
+  <pre class="install"><code>cargo add s2-kit</code></pre>
+</section>
+
+{{ section.content | safe }}
+{% endblock content %}

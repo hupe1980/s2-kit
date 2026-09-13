@@ -1,0 +1,22 @@
+{
+  "message_type": "PowerForecast",
+  "message_id": "bde674ac-66ef-4fed-8b12-d01b8404e10d",
+  "start_time": "2024-08-24T14:00:00Z",
+  "elements": [
+    {
+      "duration": 3600000,
+      "power_values": [
+        {
+          "value_upper_limit": 1000.0,
+          "value_upper_95PPR": 960.0,
+          "value_upper_68PPR": 800.0,
+          "value_expected": 545.1,
+          "value_lower_68PPR": 340.0,
+          "value_lower_95PPR": 100.0,
+          "value_lower_limit": 0.0,
+          "commodity_quantity": "ELECTRIC.POWER.L1"
+        }
+      ]
+    }
+  ]
+}

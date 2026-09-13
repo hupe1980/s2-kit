@@ -1,0 +1,96 @@
+{
+  "message_type": "FRBC.SystemDescription",
+  "message_id": "0c84b415-4e5e-429c-b5b6-116a5de6bfbf",
+  "valid_from": "2019-08-24T14:15:22Z",
+  "actuators": [
+    {
+      "id": "actuator1",
+      "diagnostic_label": "EV charger",
+      "supported_commodities": [
+        "ELECTRICITY"
+      ],
+      "operation_modes": [
+        {
+          "id": "om1",
+          "diagnostic_label": "Off",
+          "elements": [
+            {
+              "fill_level_range": {
+                "start_of_range": 0,
+                "end_of_range": 100
+              },
+              "fill_rate": {
+                "start_of_range": 0,
+                "end_of_range": 0
+              },
+              "power_ranges": [
+                {
+                  "start_of_range": 0,
+                  "end_of_range": 0,
+                  "commodity_quantity": "ELECTRIC.POWER.3_PHASE_SYMMETRIC"
+                }
+              ]
+            }
+          ],
+          "abnormal_condition_only": false
+        },
+        {
+          "id": "om2",
+          "diagnostic_label": "Charging",
+          "elements": [
+            {
+              "fill_level_range": {
+                "start_of_range": 0,
+                "end_of_range": 100
+              },
+              "fill_rate": {
+                "start_of_range": 0.00065,
+                "end_of_range": 0.0051
+              },
+              "power_ranges": [
+                {
+                  "start_of_range": 1400,
+                  "end_of_range": 11000,
+                  "commodity_quantity": "ELECTRIC.POWER.3_PHASE_SYMMETRIC"
+                }
+              ]
+            }
+          ],
+          "abnormal_condition_only": false
+        }
+      ],
+      "transitions": [
+        {
+          "id": "transition1",
+          "from": "om1",
+          "to": "om2",
+          "start_timers": [],
+          "blocking_timers": [],
+          "transition_duration": 3000,
+          "abnormal_condition_only": false
+        },
+        {
+          "id": "transition2",
+          "from": "om2",
+          "to": "om1",
+          "start_timers": [],
+          "blocking_timers": [],
+          "transition_duration": 3000,
+          "abnormal_condition_only": false
+        }
+      ],
+      "timers": []
+    }
+  ],
+  "storage": {
+    "diagnostic_label": "Battery SoC",
+    "fill_level_label": "EV Battery SoC",
+    "provides_leakage_behaviour": false,
+    "provides_fill_level_target_profile": true,
+    "provides_usage_forecast": false,
+    "fill_level_range": {
+      "start_of_range": 0,
+      "end_of_range": 100
+    }
+  }
+}

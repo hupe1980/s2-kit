@@ -1,0 +1,7 @@
+{
+  "message_type": "InstructionStatusUpdate",
+  "message_id": "xxx",
+  "instruction_id": "envelope1",
+  "status_type": "SUCCEEDED",
+  "timestamp": "2024-08-24T14:45:00Z"
+}

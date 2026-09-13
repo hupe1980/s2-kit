@@ -1,0 +1,28 @@
+{
+  "message_type": "PEBC.PowerConstraints",
+  "message_id": "xxx",
+  "id": "powerConstraint1",
+  "valid_from": "2024-08-24T14:15:22Z",
+  "valid_until": "2024-08-25T14:15:22Z",
+  "consequence_type": "VANISH",
+  "allowed_limit_ranges": [
+    {
+      "commodity_quantity": "ELECTRIC.POWER.L1",
+      "limit_type": "LOWER_LIMIT",
+      "range_boundary": {
+        "start_of_range": -4000,
+        "end_of_range": 0
+      },
+      "abnormal_condition_only": false
+    },
+    {
+      "commodity_quantity": "ELECTRIC.POWER.L1",
+      "limit_type": "UPPER_LIMIT",
+      "range_boundary": {
+        "start_of_range": 0,
+        "end_of_range": 0
+      },
+      "abnormal_condition_only": false
+    }
+  ]
+}

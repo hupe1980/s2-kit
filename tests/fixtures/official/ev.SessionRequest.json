@@ -1,0 +1,6 @@
+{
+  "message_type": "SessionRequest",
+  "message_id": "4f93f58f-0d6c-44b5-b35a-bf6dcb845c5f",
+  "request": "RECONNECT",
+  "diagnostic_label": "string"
+}

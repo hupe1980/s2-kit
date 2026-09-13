@@ -1,0 +1,11 @@
+{
+  "message_type": "PowerMeasurement",
+  "message_id": "72355bab-e58e-47c7-bada-acf0dc893218",
+  "measurement_timestamp": "2019-08-24T14:15:22Z",
+  "values": [
+    {
+      "commodity_quantity": "ELECTRIC.POWER.3_PHASE_SYMMETRIC",
+      "value": 10963
+    }
+  ]
+}

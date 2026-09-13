@@ -1,0 +1,7 @@
+{
+  "message_type": "FRBC.TimerStatus",
+  "message_id": "2ebec2c8-5cd4-46bc-9784-ea125543b544",
+  "timer_id": "timer0",
+  "actuator_id": "actuator",
+  "finished_at": "2019-08-24T14:15:22Z"
+}

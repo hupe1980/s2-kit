@@ -1,0 +1,14 @@
+{
+  "message_type": "FRBC.LeakageBehaviour",
+  "message_id": "82861374-7653-4094-9153-8c59b4fffed4",
+  "valid_from": "2019-08-24T14:15:22Z",
+  "elements": [
+    {
+      "fill_level_range": {
+        "start_of_range": 45,
+        "end_of_range": 55
+      },
+      "leakage_rate": 5e-05
+    }
+  ]
+}

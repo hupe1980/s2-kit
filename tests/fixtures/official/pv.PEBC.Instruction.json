@@ -1,0 +1,21 @@
+{
+  "message_type": "PEBC.Instruction",
+  "message_id": "xxx",
+  "id": "envelope1",
+  "execution_time": "2024-08-24T15:00:00Z",
+  "abnormal_condition": false,
+  "power_constraints_id": "powerConstraint1",
+  "power_envelopes": [
+    {
+      "id": "pe_xxx",
+      "commodity_quantity": "ELECTRIC.POWER.L1",
+      "power_envelope_elements": [
+        {
+          "duration": 3600000,
+          "upper_limit": 0,
+          "lower_limit": -2000.0
+        }
+      ]
+    }
+  ]
+}

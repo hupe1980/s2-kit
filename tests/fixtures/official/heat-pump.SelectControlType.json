@@ -1,0 +1,5 @@
+{
+  "message_type": "SelectControlType",
+  "message_id": "b44a8e22-ede6-4b1d-908f-72dd45c69106",
+  "control_type": "FILL_RATE_BASED_CONTROL"
+}

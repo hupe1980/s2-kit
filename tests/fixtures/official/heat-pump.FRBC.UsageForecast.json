@@ -1,0 +1,17 @@
+{
+  "message_type": "FRBC.UsageForecast",
+  "message_id": "9616e431-5035-404a-bd93-d673a08ebb44",
+  "start_time": "2019-08-24T14:15:22Z",
+  "elements": [
+    {
+      "duration": 0,
+      "usage_rate_upper_limit": 0,
+      "usage_rate_upper_95PPR": 0,
+      "usage_rate_upper_68PPR": 0,
+      "usage_rate_expected": 0,
+      "usage_rate_lower_68PPR": 0,
+      "usage_rate_lower_95PPR": 0,
+      "usage_rate_lower_limit": 0
+    }
+  ]
+}

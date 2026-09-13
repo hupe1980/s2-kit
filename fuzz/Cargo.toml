@@ -1,0 +1,69 @@
+[package]
+name = "s2-kit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dependencies.s2-kit]
+path = ".."
+features = ["std", "uuid", "connect-client", "connect-server"]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "id_parse"
+path = "fuzz_targets/id_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "timestamp_parse"
+path = "fuzz_targets/timestamp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_bodies"
+path = "fuzz_targets/connect_bodies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_code"
+path = "fuzz_targets/pairing_code.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz builds this crate on its own, outside the parent workspace.
+[workspace]

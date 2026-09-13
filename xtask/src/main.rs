@@ -1264,21 +1264,53 @@ fn build_peer(reference: &Path, work: &Path, peer: &Peer) -> Result<PathBuf> {
         bail!("{} is not present under specs/_reference", peer.path);
     }
     let target = work.join(peer.bin);
-    if !target.is_dir() {
-        copy_tree(&source, &target)?;
-        // The copy lives under `target/`, which is inside *this* workspace, and cargo
-        // refuses to build a package that believes it belongs to a workspace it is not a
-        // member of. An empty `[workspace]` table is cargo's own documented answer: it
-        // makes the copy its own workspace root.
-        let manifest = target.join("Cargo.toml");
-        let mut text = std::fs::read_to_string(&manifest)?;
-        if !text.contains("\n[workspace]") {
-            text.push_str("\n[workspace]\n");
-            std::fs::write(&manifest, text)?;
-        }
+    let binary = target.join("target/release").join(peer.bin);
+
+    build_peer_once(&source, &target, peer)?;
+    if binary.is_file() {
+        return Ok(binary);
+    }
+
+    // A successful build that produced no binary means cargo built something else. The
+    // copy is restored from a cache that knows nothing about it, so rather than enumerate
+    // the shapes it can come back in, start again from the source once.
+    std::fs::remove_dir_all(&target)
+        .with_context(|| format!("removing the stale copy at {}", target.display()))?;
+    build_peer_once(&source, &target, peer)?;
+    if !binary.is_file() {
+        bail!(
+            "building {} succeeded without producing {}",
+            peer.name,
+            binary.display()
+        );
+    }
+    Ok(binary)
+}
+
+fn build_peer_once(source: &Path, target: &Path, peer: &Peer) -> Result<()> {
+    // The manifest is the marker that a copy is there, not the directory. CI caches
+    // `target/` wholesale and restores `target/interop/<peer>/target/` — the artifacts it
+    // recognises — without the sources beside it, so the directory can exist with nothing
+    // in it. `cargo build` in a directory with no manifest walks *up*, finds this
+    // workspace, builds s2-kit, reports success in a tenth of a second and leaves no peer
+    // binary anywhere. `copy_tree` merges and skips `target/`, so the cached artifacts
+    // survive.
+    if !target.join("Cargo.toml").is_file() {
+        copy_tree(source, target)?;
+    }
+    // Every time, not only for a fresh copy: the copy is inside *this* workspace, cargo
+    // refuses to build a package that believes it belongs to a workspace it is not a
+    // member of, and an unpatched manifest is built as this workspace instead. An empty
+    // `[workspace]` table is cargo's own documented answer — it makes the copy its own
+    // workspace root.
+    let manifest = target.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    if !text.contains("\n[workspace]") {
+        std::fs::write(&manifest, format!("{text}\n[workspace]\n"))?;
     }
     let status = std::process::Command::new("cargo")
-        .current_dir(&target)
+        .current_dir(target)
         .args(["build", "--release"])
         // A peer's lint hygiene is not this crate's business, and CI exports
         // `RUSTFLAGS: -D warnings` for its own code. Inheriting that into somebody else's
@@ -1291,7 +1323,7 @@ fn build_peer(reference: &Path, work: &Path, peer: &Peer) -> Result<PathBuf> {
     if !status.success() {
         bail!("could not build {}", peer.name);
     }
-    Ok(target.join("target/release").join(peer.bin))
+    Ok(())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {

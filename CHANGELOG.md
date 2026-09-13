@@ -57,6 +57,10 @@ API corrections that came out of `hems`'s report on 0.2.0.
 - `tests/model_matches_schema.rs` and the generated site doctests used `s2_kit::testing`
   without requiring the feature, so `cargo test` and `cargo test --doc` failed to compile
   on the default feature set.
+- `cargo xtask interop` built the peers from `target/interop/<peer>`, keyed on the
+  directory existing. CI caches `target/` and restores that directory without the sources,
+  so cargo walked up, built s2-kit instead and reported success with no peer binary. The
+  manifest is the marker now, and a build that produces no binary re-copies and retries.
 
 ## [0.2.0] — 2026-09-13
 

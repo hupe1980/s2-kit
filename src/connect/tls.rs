@@ -37,15 +37,15 @@ use alloc::string::String;
 use alloc::sync::Arc;
 // `Vec` comes from the `std` prelude: both features that enable this module imply `std`.
 
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::CertificateDer;
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 use rustls::pki_types::{ServerName, UnixTime};
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 use rustls::{DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
 
 use super::proto::HmacBinding;
@@ -135,8 +135,8 @@ impl core::fmt::Display for Fingerprint {
     }
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 /// What a handshake revealed about the server.
 #[derive(Debug, Clone)]
 pub struct CapturedIdentity {
@@ -159,8 +159,8 @@ pub struct CapturedIdentity {
     pub chain: Vec<CertificateDer<'static>>,
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 /// How a connection decides whether to trust the server.
 #[derive(Debug, Clone)]
 pub enum TlsPolicy {
@@ -186,7 +186,7 @@ pub enum TlsPolicy {
     LanPairingOnly,
 }
 
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 impl TlsPolicy {
     /// Whether this policy actually authenticates the peer.
     #[must_use]
@@ -195,8 +195,8 @@ impl TlsPolicy {
     }
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 /// A `rustls` client configuration, and the identity the handshake captured.
 ///
 /// The capture is shared with the verifier, so it fills in during the handshake and is
@@ -207,7 +207,7 @@ pub struct TlsClient {
     captured: Arc<Capture>,
 }
 
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 impl TlsClient {
     /// Build a client configuration for a policy.
     pub fn new(policy: &TlsPolicy) -> Result<Self, Error> {
@@ -298,15 +298,15 @@ impl TlsClient {
     }
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 #[derive(Debug, Default)]
 struct Capture {
     inner: std::sync::Mutex<Option<CapturedIdentity>>,
     changed: core::sync::atomic::AtomicBool,
 }
 
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 impl Capture {
     fn set(&self, identity: CapturedIdentity) {
         let Ok(mut slot) = self.inner.lock() else {
@@ -334,16 +334,16 @@ impl Capture {
     }
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 #[derive(Debug)]
 enum Verifier {
     Real(Arc<dyn ServerCertVerifier>),
     AcceptAnything(Arc<CryptoProvider>),
 }
 
-#[cfg(feature = "connect-client")]
-#[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 /// Wraps a verifier so that the chain is recorded whatever the verdict.
 #[derive(Debug)]
 struct Recording {
@@ -351,7 +351,7 @@ struct Recording {
     captured: Arc<Capture>,
 }
 
-#[cfg(feature = "connect-client")]
+#[cfg(feature = "tokio")]
 impl ServerCertVerifier for Recording {
     fn verify_server_cert(
         &self,
@@ -637,7 +637,7 @@ mod tests {
         assert!(Fingerprint::parse(&"zz".repeat(32)).is_err());
     }
 
-    #[cfg(feature = "connect-client")]
+    #[cfg(feature = "tokio")]
     #[test]
     fn only_one_policy_declines_to_authenticate_and_it_says_so() {
         assert!(TlsPolicy::Web.authenticates());
@@ -646,7 +646,40 @@ mod tests {
         assert!(TlsPolicy::PinnedCa(der).authenticates());
     }
 
-    #[cfg(feature = "connect-client")]
+    /// Every configuration this crate builds names its provider, so `rustls`'s own
+    /// implicit lookup — which panics when the crate features are empty or ambiguous — is
+    /// never reached, and a build with no provider gets an `Err` instead (D52).
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_provider_is_chosen_explicitly_and_never_by_the_library() {
+        // A default build bundles one, so this must resolve without the application
+        // having installed anything — this is the assertion that fails if `tls-ring` ever
+        // stops reaching the `rustls` in the graph.
+        #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))]
+        {
+            let first = default_provider().expect("a bundled provider");
+            // Idempotent, and the second call reads back the first rather than racing to
+            // install a second one.
+            let second = default_provider().expect("the same provider again");
+            assert!(Arc::ptr_eq(&first, &second));
+            assert!(
+                CryptoProvider::get_default().is_some(),
+                "and it is the process-wide default afterwards"
+            );
+        }
+        // Without one it is an error a caller can report, not a panic inside rustls.
+        #[cfg(not(any(feature = "tls-ring", feature = "tls-aws-lc-rs")))]
+        {
+            if CryptoProvider::get_default().is_none() {
+                assert!(matches!(default_provider(), Err(Error::Tls(_))));
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "tokio",
+        any(feature = "tls-ring", feature = "tls-aws-lc-rs")
+    ))]
     #[test]
     fn every_policy_builds_a_usable_configuration() {
         assert!(TlsClient::new(&TlsPolicy::Web).is_ok());
@@ -659,14 +692,37 @@ mod tests {
         assert!(client.identity_is_stable());
     }
 
-    #[cfg(feature = "connect-client")]
+    /// A build with no provider is supported: it is what an application that installs its
+    /// own asks for. Until it does, every policy fails the same way — an `Error::Tls`
+    /// naming the two features and `install_default`, at the call site.
+    #[cfg(all(
+        feature = "tokio",
+        not(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))
+    ))]
+    #[test]
+    fn with_no_provider_every_policy_fails_the_same_readable_way() {
+        if CryptoProvider::get_default().is_some() {
+            return; // another test in this binary installed one first
+        }
+        for policy in [TlsPolicy::Web, TlsPolicy::LanPairingOnly] {
+            match TlsClient::new(&policy) {
+                Err(Error::Tls(message)) => {
+                    assert!(message.contains("tls-ring"), "unhelpful message: {message}");
+                    assert!(message.contains("install_default"), "{message}");
+                }
+                other => panic!("expected a readable TLS error, got {:?}", other.is_ok()),
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
     #[test]
     fn a_pinned_policy_refuses_something_that_is_not_a_certificate() {
         let nonsense = CertificateDer::from(alloc::vec![0u8; 8]);
         assert!(TlsClient::new(&TlsPolicy::PinnedCa(nonsense)).is_err());
     }
 
-    #[cfg(feature = "connect-client")]
+    #[cfg(feature = "tokio")]
     #[test]
     fn a_changed_leaf_mid_attempt_is_noticed() {
         let capture = Capture::default();
@@ -701,7 +757,7 @@ mod tests {
         assert!(endpoint.server_config().is_ok());
 
         // A client that pins this CA builds.
-        #[cfg(feature = "connect-client")]
+        #[cfg(feature = "tokio")]
         assert!(TlsClient::new(&TlsPolicy::PinnedCa(endpoint.ca.clone())).is_ok());
     }
 

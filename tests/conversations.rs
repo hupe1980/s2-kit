@@ -118,10 +118,7 @@ fn the_documented_frbc_conversation_runs_end_to_end() {
     let cem_events = c.take_cem_events();
     assert!(cem_events.iter().any(|e| matches!(
         e,
-        CemEvent::InstructionStatus {
-            status: InstructionStatus::Accepted,
-            ..
-        }
+        CemEvent::InstructionStatus(u) if u.status_type == InstructionStatus::Accepted
     )));
     c.assert_no_refusals();
 }
@@ -466,7 +463,7 @@ fn the_two_specifications_spell_one_version_two_ways_and_the_handshake_survives_
 #[test]
 fn the_two_sides_settle_on_the_beta_profile_when_that_is_all_they_share() {
     let mut c = Conversation::new(
-        RmConfig::default().offering([ProtocolVersion::new(ProtocolVersion::V0_0_2_BETA)]),
+        RmConfig::default().offering([ProtocolVersion::V0_0_2_BETA]),
         s2_kit::testing::battery_details(),
         CemConfig::default(),
     );

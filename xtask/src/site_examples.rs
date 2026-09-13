@@ -9,6 +9,11 @@
 //!
 //! It lives in `src/` rather than `tests/` because rustdoc only collects doctests from the
 //! library. `ignore` means what it means to rustdoc: rendered, not run.
+//!
+//! Each carrier gets the `#[cfg]` its snippet needs, inferred from the module paths the
+//! snippet names: doctests compile with whatever features the `cargo test` that collected
+//! them enabled, so an ungated block reaching for `s2_kit::testing` is a hard error in a
+//! file nobody edits.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -28,7 +33,9 @@ pub fn generate(root: &Path) -> std::io::Result<usize> {
          //! Fix the Markdown, then re-run the generator.\n\
          //!\n\
          //! The module is `cfg(doctest)`, so it costs a normal build nothing: rustdoc is\n\
-         //! the only thing that ever compiles it.\n\n\
+         //! the only thing that ever compiles it. A block that needs a feature carries the\n\
+         //! `#[cfg]` for it, so `cargo test --doc` runs whatever the enabled features can\n\
+         //! actually compile and skips the rest.\n\n\
          // Each carrier is named after the file and block it came from, so a failure names\n\
          // the Markdown to fix. That is worth more here than the casing convention.\n\
          #![allow(non_camel_case_types)]\n\n",
@@ -53,9 +60,10 @@ pub fn generate(root: &Path) -> std::io::Result<usize> {
         }
         let _ = write!(
             out,
-            "/// ```\n\
+            "/// ```\n{}\
              #[allow(non_snake_case, dead_code)]\n\
-             struct {name}_{index};\n\n"
+             struct {name}_{index};\n\n",
+            required_cfg(body)
         );
     }
 
@@ -120,4 +128,39 @@ fn rust_blocks(text: &str) -> Vec<(String, String)> {
         out.push((flags, body));
     }
     out
+}
+
+/// The `#[cfg]` line a snippet needs, or the empty string.
+///
+/// Inferred from the module paths it names rather than declared in the Markdown: a guide
+/// should not have to carry this crate's feature names in its prose, and a path is the
+/// thing that actually fails to resolve. Keep this in step with `lib.rs`'s gates.
+fn required_cfg(body: &str) -> String {
+    // Longest path first: `connect::client` must win over `connect`.
+    const GATES: &[(&str, &str)] = &[
+        ("s2_kit::connect::client", "connect-client"),
+        ("s2_kit::connect::server", "connect-server"),
+        ("s2_kit::connect::discovery", "discovery"),
+        ("s2_kit::connect::tls", "tokio"),
+        ("s2_kit::testing", "testing"),
+        ("s2_kit::io", "tokio"),
+        ("s2_kit::uuid", "uuid"),
+    ];
+
+    let mut features: Vec<&str> = GATES
+        .iter()
+        .filter(|(path, _)| body.contains(path))
+        .map(|(_, feature)| *feature)
+        .collect();
+    features.sort_unstable();
+    features.dedup();
+
+    match features.as_slice() {
+        [] => String::new(),
+        [one] => format!("#[cfg(feature = \"{one}\")]\n"),
+        many => {
+            let list: Vec<String> = many.iter().map(|f| format!("feature = \"{f}\"")).collect();
+            format!("#[cfg(all({}))]\n", list.join(", "))
+        }
+    }
 }

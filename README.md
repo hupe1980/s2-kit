@@ -199,7 +199,7 @@ with `==` is a pairing that fails between two implementations that speak the sam
 |---|---|
 | `std` *(default)* | The standard library. Without it the crate is `no_std + alloc`. |
 | `uuid` *(default)* | `Id::generate()` and friends. |
-| `tokio` | `io::Driver`, which pumps a session over any text transport, and a WebSocket. |
+| `tokio` | `io::Driver`, which pumps a session over any text transport, and a `wss://` WebSocket. Carries `rustls` and the OS trust store. |
 | `connect-client` | Pairing and session initiation over `reqwest`/`rustls`, with leaf-fingerprint capture and CA pinning. |
 | `connect-server` | An `axum` router for both APIs and the authorised WebSocket, TLS serving, and a self-signed CA helper. |
 | `discovery` | DNS-SD advertise and browse of `_s2connect._tcp`, pure Rust (no Avahi). |
@@ -210,6 +210,11 @@ with `==` is a pairing that fails between two implementations that speak the sam
 | `tracing` | Structured events from the drivers: what crossed the wire, and what was refused. |
 | `schemars` | `JsonSchema` for this crate's own types. |
 | `cli` | The `s2-kit` command-line tool. |
+
+`tls-ring` being a default does not mean every consumer links it: a plain `s2-kit = "…"`
+dependency pulls no TLS stack at all. The provider features apply to builds that enable
+`tokio` or a `connect-*` feature, and an application that installs its own provider can
+turn both off.
 
 ## 🖥️ Command-line tool
 
@@ -282,12 +287,13 @@ seven fuzz targets nightly.
 
 ## 🐛 Errata
 
-Implementing a standard carefully means finding its rough edges. Twenty-nine are recorded
+Implementing a standard carefully means finding its rough edges. Thirty are recorded
 with how each is handled — among them an `ID` documented as a UUID and defined as a
 pattern that is not one, two control-type descriptions that are swapped, `NOT_CONTROLABLE`
 and `supported_commodites` misspelled on the wire, a pairing rate limit that bounds online
-guessing while the same endpoint hands out an offline oracle, and two specifications that
-spell one version number two different ways and then compare it with `==`.
+guessing while the same endpoint hands out an offline oracle, two specifications that
+spell one version number two different ways and then compare it with `==`, and a `roles`
+array capped at three when there are four commodities to play a role in.
 
 Two of them are in the standard's own published examples. The EV walkthrough's
 `FRBC.ActuatorStatus` names operation mode `"string"` while its own description declares

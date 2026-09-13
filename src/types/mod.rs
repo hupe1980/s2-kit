@@ -30,7 +30,7 @@ pub use common::*;
 pub use id::{Id, InvalidId};
 pub use time::{Duration, InvalidTimestamp, TimeOutOfRange, Timestamp};
 
-use alloc::borrow::ToOwned;
+use alloc::borrow::{Cow, ToOwned};
 use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
@@ -44,20 +44,48 @@ use serde::{Deserialize, Serialize};
 /// The complication is that the deployed ecosystem negotiates `"0.0.2-beta"` — the tag
 /// that predates S2 JSON v1.0.0 — while the schemas are tagged `v1.0.0`. Both are
 /// supported; [`WireProfile`] is what a version string means for the wire.
+///
+/// Every version this crate speaks is an associated constant of this type, in both
+/// spellings, so naming one costs nothing and mentions it once:
+///
+/// ```
+/// use s2_kit::{ProtocolVersion, WireProfile};
+///
+/// // What an S2 JSON handshake writes, and what S2 Connect writes (erratum E25).
+/// assert_eq!(ProtocolVersion::V1_0_0.as_str(), "1.0.0");
+/// assert_eq!(ProtocolVersion::V1_0_0_CONNECT.as_str(), "v1.0.0");
+///
+/// // Same version either way.
+/// assert!(ProtocolVersion::V1_0_0.matches(&ProtocolVersion::V1_0_0_CONNECT));
+///
+/// // And a profile hands out both without allocating.
+/// assert_eq!(WireProfile::V0_0_2Beta.version(), ProtocolVersion::V0_0_2_BETA);
+/// ```
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ProtocolVersion(String);
+pub struct ProtocolVersion(Cow<'static, str>);
 
 impl ProtocolVersion {
-    /// S2 JSON v1.0.0, the current tag.
-    pub const V1_0_0: &'static str = "1.0.0";
+    /// S2 JSON v1.0.0, the current tag, as an S2 JSON handshake spells it.
+    pub const V1_0_0: Self = Self::from_static("1.0.0");
     /// S2 JSON v0.0.2-beta, what every deployed implementation still negotiates.
-    pub const V0_0_2_BETA: &'static str = "0.0.2-beta";
+    pub const V0_0_2_BETA: Self = Self::from_static("0.0.2-beta");
+    /// S2 JSON v1.0.0 as **S2 Connect** spells it, with the `v` (erratum E25).
+    pub const V1_0_0_CONNECT: Self = Self::from_static("v1.0.0");
+    /// S2 JSON v0.0.2-beta as **S2 Connect** spells it, with the `v` (erratum E25).
+    pub const V0_0_2_BETA_CONNECT: Self = Self::from_static("v0.0.2-beta");
 
     /// Wrap a version string exactly as it will appear on the wire.
     #[must_use]
     pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+        Self(Cow::Owned(s.into()))
+    }
+
+    /// Wrap a `'static` version string without allocating. `const`, and what the
+    /// associated constants above are built from.
+    #[must_use]
+    pub const fn from_static(s: &'static str) -> Self {
+        Self(Cow::Borrowed(s))
     }
 
     /// The string.
@@ -105,13 +133,13 @@ impl ProtocolVersion {
 
 impl From<&str> for ProtocolVersion {
     fn from(s: &str) -> Self {
-        Self(s.to_owned())
+        Self(Cow::Owned(s.to_owned()))
     }
 }
 
 impl From<String> for ProtocolVersion {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(Cow::Owned(s))
     }
 }
 
@@ -158,8 +186,8 @@ impl WireProfile {
     #[must_use]
     pub const fn version_str(self) -> &'static str {
         match self {
-            Self::V1_0_0 => ProtocolVersion::V1_0_0,
-            Self::V0_0_2Beta => ProtocolVersion::V0_0_2_BETA,
+            Self::V1_0_0 => "1.0.0",
+            Self::V0_0_2Beta => "0.0.2-beta",
         }
     }
 
@@ -175,16 +203,22 @@ impl WireProfile {
         }
     }
 
-    /// The version string, as a [`ProtocolVersion`].
+    /// The version string, as a [`ProtocolVersion`]. Allocation-free.
     #[must_use]
-    pub fn version(self) -> ProtocolVersion {
-        ProtocolVersion::new(self.version_str())
+    pub const fn version(self) -> ProtocolVersion {
+        match self {
+            Self::V1_0_0 => ProtocolVersion::V1_0_0,
+            Self::V0_0_2Beta => ProtocolVersion::V0_0_2_BETA,
+        }
     }
 
-    /// The S2 Connect version string, as a [`ProtocolVersion`].
+    /// The S2 Connect version string, as a [`ProtocolVersion`]. Allocation-free.
     #[must_use]
-    pub fn connect_version(self) -> ProtocolVersion {
-        ProtocolVersion::new(self.connect_version_str())
+    pub const fn connect_version(self) -> ProtocolVersion {
+        match self {
+            Self::V1_0_0 => ProtocolVersion::V1_0_0_CONNECT,
+            Self::V0_0_2Beta => ProtocolVersion::V0_0_2_BETA_CONNECT,
+        }
     }
 
     /// Whether `DDBC.SystemDescription` must carry `present_demand_rate`.
@@ -209,6 +243,40 @@ impl core::fmt::Display for WireProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_constants_are_the_strings_the_two_specifications_write() {
+        // Both spellings are values rather than loose `&str`s: naming a version is the
+        // commonest thing a consumer does, and it should mention the version once.
+        assert_eq!(ProtocolVersion::V1_0_0.as_str(), "1.0.0");
+        assert_eq!(ProtocolVersion::V1_0_0_CONNECT.as_str(), "v1.0.0");
+        assert_eq!(ProtocolVersion::V0_0_2_BETA.as_str(), "0.0.2-beta");
+        assert_eq!(ProtocolVersion::V0_0_2_BETA_CONNECT.as_str(), "v0.0.2-beta");
+
+        // The `v` is the only latitude, so the two spellings are the same version.
+        assert!(ProtocolVersion::V1_0_0.matches(&ProtocolVersion::V1_0_0_CONNECT));
+        assert!(ProtocolVersion::V0_0_2_BETA.matches(&ProtocolVersion::V0_0_2_BETA_CONNECT));
+        assert!(!ProtocolVersion::V1_0_0.matches(&ProtocolVersion::V0_0_2_BETA));
+
+        // And they are exactly what the profiles hand out, without allocating.
+        for profile in WireProfile::all() {
+            assert_eq!(profile.version().as_str(), profile.version_str());
+            assert_eq!(
+                profile.connect_version().as_str(),
+                profile.connect_version_str()
+            );
+        }
+
+        // `#[serde(transparent)]` over a `Cow` is still a bare JSON string.
+        assert_eq!(
+            serde_json::to_string(&ProtocolVersion::V0_0_2_BETA).unwrap(),
+            "\"0.0.2-beta\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProtocolVersion>("\"v1.0.0\"").unwrap(),
+            ProtocolVersion::V1_0_0_CONNECT
+        );
+    }
 
     #[test]
     fn version_strings_map_to_profiles_exactly() {

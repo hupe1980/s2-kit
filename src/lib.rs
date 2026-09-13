@@ -144,10 +144,11 @@ pub mod prelude {
     pub use crate::validate::{Report, RuleId, Severity, Validate, Violation};
 }
 
-// The optional time crates are re-exported so a caller can always name the exact version
-// this crate was built against, rather than having to keep a second dependency's major
-// version in step by hand. `hems` filed that complaint against `s2energy`, whose public
-// API is full of `chrono::DateTime` with no re-export.
+// The rule for this block: if a type from crate `X` is reachable from this crate's public
+// API, `X` is re-exported here under the feature that brings it in — so a caller names the
+// version this crate was built against instead of keeping a major in step by hand. A
+// drifted one otherwise reports `expected MaybeTlsStream<TcpStream>, found
+// MaybeTlsStream<TcpStream>`.
 #[cfg(feature = "chrono")]
 #[cfg_attr(docsrs, doc(cfg(feature = "chrono")))]
 pub use chrono;
@@ -160,3 +161,28 @@ pub use time;
 #[cfg(feature = "uuid")]
 #[cfg_attr(docsrs, doc(cfg(feature = "uuid")))]
 pub use uuid;
+
+// `WebSocket::connect` returns a
+// `WebSocket<MaybeTlsStream<TcpStream>>`; [`io::Dialled`] is its short spelling.
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use tokio;
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use tokio_tungstenite;
+
+// `TlsPolicy::PinnedCa` carries a `CertificateDer`, `TlsClient::config` an
+// `Arc<ClientConfig>`, `default_provider` an `Arc<CryptoProvider>`.
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use rustls;
+
+// `connect::server`'s routers are `axum::Router`s, mounted in an application's own.
+#[cfg(feature = "connect-server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "connect-server")))]
+pub use axum;
+
+// `Discovery::daemon` hands back the `mdns_sd::ServiceDaemon` it is driving.
+#[cfg(feature = "discovery")]
+#[cfg_attr(docsrs, doc(cfg(feature = "discovery")))]
+pub use mdns_sd;

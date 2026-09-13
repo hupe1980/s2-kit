@@ -99,6 +99,25 @@ pub struct WebSocket<S> {
     stream: tokio_tungstenite::WebSocketStream<S>,
 }
 
+/// The socket [`WebSocket::connect`] returns.
+///
+/// Long-hand it is `WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>`:
+/// three foreign names a struct that stores a driver would otherwise have to write down.
+/// [`tokio_tungstenite`] is re-exported at the crate root for what this alias does not
+/// cover.
+///
+/// ```no_run
+/// struct Gateway {
+///     socket: s2_kit::io::Dialled,
+/// }
+/// # async fn run() -> Result<(), s2_kit::io::Error> {
+/// let gateway = Gateway { socket: s2_kit::io::WebSocket::connect("wss://hub.local/s2", None).await? };
+/// # let _ = gateway;
+/// # Ok(())
+/// # }
+/// ```
+pub type Dialled = WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 /// How to open a [`WebSocket`].
 ///
 /// The one setting that is not a URL is the size cap, and it is here because it has to be
@@ -115,9 +134,8 @@ pub struct WebSocketOptions<'a> {
     pub bearer: Option<&'a str>,
     /// The largest frame the transport will buffer. `None` is the codec's own default.
     pub max_message_bytes: Option<usize>,
-    /// How to authenticate the server's certificate. `None` is the public PKI.
-    #[cfg(feature = "connect-client")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+    /// How to authenticate the server's certificate. `None` is
+    /// [`TlsPolicy::Web`](crate::connect::tls::TlsPolicy::Web), the public PKI.
     pub policy: Option<&'a crate::connect::tls::TlsPolicy>,
 }
 
@@ -137,8 +155,6 @@ impl<'a> WebSocketOptions<'a> {
     }
 
     /// Authenticate the server under this TLS policy.
-    #[cfg(feature = "connect-client")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
     #[must_use]
     pub const fn policy(mut self, policy: &'a crate::connect::tls::TlsPolicy) -> Self {
         self.policy = Some(policy);
@@ -151,7 +167,7 @@ impl<'a> WebSocketOptions<'a> {
     }
 }
 
-impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+impl Dialled {
     /// Connect to a URL, with the bearer token S2 Connect's session initiation issued.
     ///
     /// `S2C §Authentication`: "the client **must** authenticate itself using the
@@ -173,48 +189,48 @@ impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     }
 
     /// Connect with everything spelled out: bearer, size cap and TLS policy.
+    ///
+    /// A `wss://` dial always supplies its own
+    /// [`Connector::Rustls`](tokio_tungstenite::Connector::Rustls), built from
+    /// [`default_provider`](crate::connect::tls::default_provider): the application's
+    /// provider if it installed one, this build's otherwise, and an [`Error::Transport`]
+    /// rather than a panic when there is none. Letting `rustls` resolve its own provider
+    /// panics when no provider feature is on and panics again when two are (D52).
     pub async fn open(url: &str, options: &WebSocketOptions<'_>) -> Result<Self, Error> {
-        #[cfg(feature = "connect-client")]
-        let connector = match options.policy {
-            None => None,
-            Some(policy) => {
-                // A session must never run unauthenticated: the pairing-only policy exists
-                // for the four pairing requests and nothing else.
-                if !policy.authenticates() {
-                    return Err(Error::Transport(
-                        "a session must not run under the pairing-only TLS policy".to_string(),
-                    ));
-                }
-                let client = crate::connect::tls::TlsClient::new(policy)
-                    .map_err(|e| Error::Transport(e.to_string()))?;
-                Some(tokio_tungstenite::Connector::Rustls(client.config()))
-            }
-        };
-        #[cfg(not(feature = "connect-client"))]
-        let connector = None;
-        Self::dial(url, options.bearer, connector, options.limit()).await
+        use crate::connect::tls::TlsPolicy;
+
+        // A session must never run unauthenticated: the pairing-only policy exists for the
+        // four pairing requests and nothing else.
+        if let Some(policy) = options.policy
+            && !policy.authenticates()
+        {
+            return Err(Error::Transport(
+                "a session must not run under the pairing-only TLS policy".to_string(),
+            ));
+        }
+        let web = TlsPolicy::Web;
+        let policy = options.policy.unwrap_or(&web);
+        Self::dial(url, options.bearer, policy, options.limit()).await
     }
 
     /// Connect under a [`TlsPolicy`](crate::connect::tls::TlsPolicy) — which, after a LAN
     /// pairing, is the CA that pairing pinned.
     ///
-    /// This is the companion of [`connect::client::Session`](crate::connect::client) and
-    /// the one to use in a LAN. The session initiation that produced the communication
-    /// token ran against the pinned CA; connecting the WebSocket against a bundled root
-    /// list instead would either fail outright — which is what it does — or, worse,
-    /// succeed against a different server.
+    /// This is the one to use in a LAN, with the policy
+    /// `connect::client::Paired::policy` returns. The session initiation that produced the
+    /// communication token ran against the pinned CA; connecting the WebSocket against a
+    /// bundled root list instead would either fail outright — which is what it does — or,
+    /// worse, succeed against a different server.
     ///
     /// ```no_run
-    /// # use s2_kit::io::WebSocket;
-    /// # async fn run(paired: s2_kit::connect::client::Paired, url: &str, token: &str)
+    /// # use s2_kit::{connect::tls::TlsPolicy, io::WebSocket};
+    /// # async fn run(policy: &TlsPolicy, url: &str, token: &str)
     /// # -> Result<(), Box<dyn std::error::Error>> {
-    /// let socket = WebSocket::connect_with_policy(url, Some(token), &paired.policy()).await?;
+    /// let socket = WebSocket::connect_with_policy(url, Some(token), policy).await?;
     /// # let _ = socket;
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "connect-client")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
     pub async fn connect_with_policy(
         url: &str,
         bearer: Option<&str>,
@@ -234,12 +250,26 @@ impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     async fn dial(
         url: &str,
         bearer: Option<&str>,
-        connector: Option<tokio_tungstenite::Connector>,
+        policy: &crate::connect::tls::TlsPolicy,
         max_message_bytes: usize,
     ) -> Result<Self, Error> {
         let mut request = url
             .into_client_request()
             .map_err(|e| Error::Transport(e.to_string()))?;
+        // Off the parsed URI rather than off the string: `IntoClientRequest` has already
+        // done the work, and a `ws://` dial should not pay for a certificate verifier it
+        // will never consult.
+        let connector = if request
+            .uri()
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("wss"))
+        {
+            let client = crate::connect::tls::TlsClient::new(policy)
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            Some(tokio_tungstenite::Connector::Rustls(client.config()))
+        } else {
+            None
+        };
         if let Some(token) = bearer {
             let value = alloc::format!("Bearer {token}")
                 .parse()

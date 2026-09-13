@@ -12,7 +12,53 @@ definition.
 
 Nothing yet.
 
-## [0.2.0] — unreleased
+## [0.3.0] — unreleased
+
+Breaking. A crypto-provider fix that changes what the `tokio` feature pulls in, and three
+API corrections that came out of `hems`'s report on 0.2.0.
+
+### Breaking
+
+- `S2-RMD-003` is keyed on the `(role, commodity)` **pair**, not the commodity alone:
+  `roles` is capped at three, there are three `RoleType`s and four `Commodity`s, so the
+  cap counts role types and a battery may be storage, consumer *and* producer of
+  electricity (E30). The identifier is kept — the condition is narrowed, not replaced.
+- `CemEvent::InstructionStatus` carries the whole `InstructionStatusUpdate`. The old
+  projection dropped `timestamp`, which is when the status last *changed* rather than when
+  the message arrived (D53).
+- `ProtocolVersion::V1_0_0` and `V0_0_2_BETA` are associated constants of the type, not
+  `&'static str`, joined by `V1_0_0_CONNECT`/`V0_0_2_BETA_CONNECT` for the `v` spelling
+  S2 Connect requires (E25). The type wraps a `Cow<'static, str>`, so naming a version
+  allocates nothing: `ProtocolVersion::new(ProtocolVersion::V1_0_0)` is now `::V1_0_0`.
+- The `tokio` feature activates `rustls`, `rustls-pki-types` and
+  `rustls-platform-verifier`. `connect::tls`, `TlsPolicy` and `WebSocketOptions::policy`
+  are available whenever `tokio` is, having been `connect-client`-only.
+
+### Added
+
+- `io::Dialled`, the name for `WebSocket<MaybeTlsStream<TcpStream>>`.
+- Crate-root re-exports of every dependency whose types reach the public API: `tokio`,
+  `tokio_tungstenite`, `rustls` (with `tokio`), `axum` (`connect-server`), `mdns_sd`
+  (`discovery`), joining `chrono`/`jiff`/`time`/`uuid`.
+- `tests/manifest.rs`: invariants of the feature graph, which neither `cargo tree` nor the
+  compiler can see.
+
+### Fixed
+
+- **`--features tokio` compiled a TLS stack with no crypto provider, and the first
+  `wss://` dial panicked inside `rustls`**: `rustls` arrived transitively through
+  `tokio-tungstenite`, so `tls-ring = ["rustls?/ring", …]` reached nothing. Every dial now
+  supplies its own `Connector::Rustls` from `connect::tls::default_provider()`, which also
+  makes the ambiguous case — an application that installed `aws-lc-rs` against a
+  `tls-ring` build — unreachable, and a provider-less build an `Error` (D52).
+- `tokio-tungstenite`'s `rustls-tls-webpki-roots` is dropped, removing a second copy of
+  Mozilla's root list that nothing read. `WebSocket::connect` verifies against the
+  platform trust store, as `TlsPolicy::Web` always did.
+- `tests/model_matches_schema.rs` and the generated site doctests used `s2_kit::testing`
+  without requiring the feature, so `cargo test` and `cargo test --doc` failed to compile
+  on the default feature set.
+
+## [0.2.0] — 2026-09-13
 
 Breaking. Nothing else implements S2 JSON v1.0.0, so most of what changed came from
 running against the implementations that do exist — the official crate, linked; and the
@@ -171,6 +217,7 @@ First release. Implements **S2 JSON v1.0.0** and **S2 Connect 1.0.0**.
   own published examples. The fixtures are kept verbatim and the findings asserted by
   name.
 
-[Unreleased]: https://github.com/hupe1980/s2-kit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hupe1980/s2-kit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hupe1980/s2-kit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/s2-kit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/s2-kit/releases/tag/v0.1.0

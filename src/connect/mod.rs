@@ -42,11 +42,10 @@
 
 pub mod proto;
 
-#[cfg(any(feature = "connect-client", feature = "connect-server"))]
-#[cfg_attr(
-    docsrs,
-    doc(cfg(any(feature = "connect-client", feature = "connect-server")))
-)]
+// Gated on `tokio` rather than the `connect-*` features: the WebSocket driver needs the
+// same provider and the same `TlsPolicy`, and both `connect-*` imply `tokio` (D52).
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub mod tls;
 
 #[cfg(feature = "connect-client")]

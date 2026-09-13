@@ -121,6 +121,15 @@ The driver is deliberately thin — it flushes, waits for the first of {a frame,
 session's deadline, the keep-alive interval}, and feeds the result back in. Everything
 that *decides* anything is in the session.
 
+`WebSocket::connect` returns an [`io::Dialled`](https://docs.rs/s2-kit/latest/s2_kit/io/type.Dialled.html),
+the name for `WebSocket<MaybeTlsStream<TcpStream>>`. Every dependency whose types reach
+this crate's public API is re-exported from the crate root — `s2_kit::tokio_tungstenite`,
+`s2_kit::rustls`, `s2_kit::axum` — so nothing has to track a foreign major version by hand.
+
+The certificate is verified against the platform trust store. For a LAN peer whose
+certificate was pinned during pairing, use `WebSocket::connect_with_policy` — see
+[S2 Connect](@/docs/connect.md).
+
 ## Where next
 
 - [Validation](@/docs/validation.md) — what the 65 rules check, and why some are warnings.

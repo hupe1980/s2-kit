@@ -453,9 +453,11 @@ fn cases() -> Vec<(RuleId, Report)> {
         (
             rules::DUPLICATE_ROLE,
             alone(ResourceManagerDetails {
+                // The *same pair* twice. Storage-plus-consumer on one commodity is not
+                // this rule's business — see `several_roles_for_one_commodity_are_fine`.
                 roles: vec![
                     Role::new(RoleType::EnergyStorage, Commodity::Electricity),
-                    Role::new(RoleType::EnergyConsumer, Commodity::Electricity),
+                    Role::new(RoleType::EnergyStorage, Commodity::Electricity),
                 ],
                 ..details.clone()
             }),
@@ -1188,6 +1190,43 @@ fn every_case_fires_the_rule_it_claims_to() {
 /// `S2J messages/FRBC.ActuatorStatus.previous_operation_mode_id`: mandatory "unless the
 /// active FRBC.OperationMode is the first ... the Resource Manager is aware of" — which is
 /// a fact about one actuator, and a system may describe ten.
+/// A resource may play several roles for one commodity, and saying so is not a defect.
+///
+/// `roles` is capped at `maxItems: 3`; there are three `RoleType`s and four
+/// `Commodity`s, so the cap counts role types (erratum E30). A battery is a store, a
+/// load and a generator for electricity, and a CEM told only `ENERGY_STORAGE` has not
+/// been told it can be curtailed or shed. `S2-RMD-003` reports the repeated
+/// `(role, commodity)` pair and nothing else.
+#[test]
+fn several_roles_for_one_commodity_are_fine() {
+    let battery = ResourceManagerDetails {
+        roles: vec![
+            Role::new(RoleType::EnergyStorage, Commodity::Electricity),
+            Role::new(RoleType::EnergyConsumer, Commodity::Electricity),
+            Role::new(RoleType::EnergyProducer, Commodity::Electricity),
+        ],
+        ..details()
+    };
+    let report = alone(battery.clone());
+    assert!(
+        !report.contains(rules::DUPLICATE_ROLE),
+        "three roles for electricity are what the schema's cap of three allows: {report:?}"
+    );
+    assert!(
+        report.is_empty(),
+        "and nothing else fires either: {report:?}"
+    );
+
+    // The cap itself is still enforced, by S2-MSG-001.
+    let mut four = battery;
+    four.roles
+        .push(Role::new(RoleType::EnergyConsumer, Commodity::Heat));
+    assert!(
+        alone(four).contains(rules::ARRAY_BOUNDS),
+        "a fourth role exceeds the schema's maxItems of 3"
+    );
+}
+
 #[test]
 fn the_previous_mode_rule_is_per_actuator() {
     let first_status = |actuator: &str| frbc::ActuatorStatus {

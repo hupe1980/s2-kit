@@ -118,12 +118,8 @@ fn main() {
         }
         c.pump();
         for event in c.take_cem_events() {
-            if let CemEvent::InstructionStatus {
-                instruction_id,
-                status,
-            } = event
-            {
-                println!("  {instruction_id} → {status:?}");
+            if let CemEvent::InstructionStatus(u) = event {
+                println!("  {} → {:?}", u.instruction_id, u.status_type);
             }
         }
         c.advance(Duration::from_secs(300));

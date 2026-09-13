@@ -1,6 +1,6 @@
 +++
 title = "Errata"
-description = "Twenty-nine rough edges found in the S2 specification while implementing it — contradictions, typos on the wire, and gaps — with how s2-kit handles each one."
+description = "Thirty rough edges found in the S2 specification while implementing it — contradictions, typos on the wire, and gaps — with how s2-kit handles each one."
 weight = 50
 +++
 
@@ -63,6 +63,7 @@ not a feature.
 | E27 | `S2C §Unpairing by the communication server` vs `S2C-OAS session-init` | The unpairing section tells a client that "the next `/[version]/initiateConnection` HTTPS API request **must** fail with the `No longer paired` response". There is no `initiateConnection` operation: the OpenAPI path is `/initiateSession`, and every other passage in the same document spells it that way. A reader implementing unpairing from this paragraph looks for an endpoint that does not exist — the sibling of E8, which is the same slip about a file name | Documentation only; the crate implements `initiateSession`, and `SessionInitClient::unpaired` is what drives it. Upstream issue |
 | E28 | `S2C-OAS pairing` | The `/finalizePairing` path carries `operationId: confirmPairing`. Every other operation is named after its path, and a generator that names client methods from `operationId` — which is what generators do — produces a `confirm_pairing` for a `/finalizePairing` nobody can find by searching for it | The path is what goes on the wire and the path is what this crate uses; the `operationId` is named in a comment beside it. Upstream issue |
 | E29 | `S2C-OAS session-init/confirmAccessToken` | The one `POST` in either file that defines **no** `requestBody` — the bearer is the whole message. Defensible, and also the kind of asymmetry a client written from the pattern rather than from the file gets wrong by posting an empty JSON document | No request body is sent. Posting `null` with a JSON content type is a body the specification does not define, and a peer validating against the OpenAPI may refuse it |
+| E30 | `S2J messages/ResourceManagerDetails.roles` | `roles` is capped at `maxItems: 3`. There are three `RoleType`s and **four** `Commodity`s, so the cap cannot be counting commodities — it is counting role types, and a resource may declare several roles for one commodity. The text never says so, nor what a CEM should do with more than one | Read as the cap reads. `S2-RMD-003` reports only the repeated `(role, commodity)` pair; a battery declared as storage, consumer *and* producer of electricity is legal, which is the reading a CEM told only `ENERGY_STORAGE` needs |
 
 ## Reporting
 

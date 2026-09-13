@@ -204,6 +204,13 @@ Yours, if you have already chosen one. `rustls` takes its algorithms from a
 application with two crypto stacks and whichever won a race. `s2-kit` reads
 `CryptoProvider::get_default()` first and only falls back to a bundled provider.
 
+It also never lets `rustls` pick for itself. `ClientConfig::builder()` resolves the
+provider implicitly from crate features and **panics** when that is empty or ambiguous —
+an application that has already installed `aws-lc-rs` would panic against a build carrying
+`tls-ring`. Every configuration this crate builds names its provider instead, including
+the one behind `WebSocket::connect`. With no provider at all you get an `Error` naming the
+two features and `install_default`.
+
 | Feature | Backend | Pick it for |
 |---|---|---|
 | `tls-ring` *(default)* | `ring` 0.17 | Cross-compiling without `cmake` or a C toolchain — what a gateway build needs. Maintained by the `rustls` team; the unmaintained advisory covers only versions before 0.17. |

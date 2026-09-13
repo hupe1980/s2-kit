@@ -15,7 +15,7 @@ use crate::codec::{self, Strictness};
 use crate::message::{Message, MessageKind};
 use crate::types::common::{
     Consequence, ControlType, EnergyManagementRole, Handshake, HandshakeResponse,
-    InstructionStatus, PowerForecast, PowerMeasurement, ReceptionStatusValues,
+    InstructionStatusUpdate, PowerForecast, PowerMeasurement, ReceptionStatusValues,
     ResourceManagerDetails, RevokableObjects, RevokeObject, SelectControlType, SessionRequest,
     SessionRequestType,
 };
@@ -65,10 +65,7 @@ impl Default for CemConfig {
     fn default() -> Self {
         Self {
             negotiation: Negotiation::Handshake,
-            supported_versions: alloc::vec![
-                ProtocolVersion::new(ProtocolVersion::V1_0_0),
-                ProtocolVersion::new(ProtocolVersion::V0_0_2_BETA),
-            ],
+            supported_versions: alloc::vec![ProtocolVersion::V1_0_0, ProtocolVersion::V0_0_2_BETA,],
             ack_timeout: Duration::from_secs(5),
             out_of_order: OutOfOrderPolicy::Report,
             skew_tolerance: Duration::from_secs(30),
@@ -160,12 +157,11 @@ pub enum CemEvent {
     /// A forecast arrived.
     Forecast(Box<PowerForecast>),
     /// What became of an instruction this manager sent.
-    InstructionStatus {
-        /// Which instruction.
-        instruction_id: Id,
-        /// Its new status.
-        status: InstructionStatus,
-    },
+    ///
+    /// The whole update, not just the status: `timestamp` is "when status_type has
+    /// changed the last time", which is **not** when the message arrived, and a manager
+    /// reconciling a late `SUCCEEDED` against its own dispatch log needs the difference.
+    InstructionStatus(InstructionStatusUpdate),
     /// The resource reported on a timer.
     ///
     /// Reported, not *finished*: `S2J messages/*.TimerStatus.finished_at` says that "if
@@ -670,10 +666,7 @@ impl CemSession {
             }
             Message::PowerForecast(f) => self.events.push_back(CemEvent::Forecast(f)),
             Message::InstructionStatusUpdate(u) => {
-                self.events.push_back(CemEvent::InstructionStatus {
-                    instruction_id: u.instruction_id,
-                    status: u.status_type,
-                });
+                self.events.push_back(CemEvent::InstructionStatus(u));
             }
             Message::FrbcTimerStatus(ref s) => self.events.push_back(CemEvent::TimerReported {
                 actuator: Some(s.actuator_id),

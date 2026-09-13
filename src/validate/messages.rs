@@ -18,7 +18,7 @@ use crate::message::Message;
 use crate::types::common::{
     Commodity, CommodityQuantity, ControlType, EnergyManagementRole, Handshake, HandshakeResponse,
     InstructionStatusUpdate, NumberRange, PowerForecast, PowerForecastValue, PowerMeasurement,
-    PowerRange, ReceptionStatus, ResourceManagerDetails, RevokeObject, SelectControlType,
+    PowerRange, ReceptionStatus, ResourceManagerDetails, RevokeObject, Role, SelectControlType,
     SessionRequest,
 };
 use crate::types::{Id, ddbc, frbc, ombc, pebc, ppbc};
@@ -231,16 +231,23 @@ impl Validate for ResourceManagerDetails {
             out,
         );
 
-        let mut commodities = Vec::new();
+        // The `(role, commodity)` pair, not the commodity alone: `roles` is capped at
+        // three, there are three `RoleType`s and four `Commodity`s, so the cap counts
+        // role types and a resource may be storage, load and generator for one commodity
+        // (S2-RMD-003, erratum E30). Only the repeated pair says nothing.
+        let mut seen: Vec<Role> = Vec::new();
         for (i, role) in self.roles.iter().enumerate() {
-            if commodities.contains(&role.commodity) {
+            if seen.contains(role) {
                 out.push(
                     rules::DUPLICATE_ROLE,
                     &index(&child(path, "roles"), i),
-                    format!("{:?} already has a role in this resource", role.commodity),
+                    format!(
+                        "{:?} is already declared for {:?} in this resource",
+                        role.role, role.commodity
+                    ),
                 );
             } else {
-                commodities.push(role.commodity);
+                seen.push(*role);
             }
         }
 

@@ -63,10 +63,7 @@ impl Default for RmConfig {
     fn default() -> Self {
         Self {
             negotiation: Negotiation::Handshake,
-            offered_versions: alloc::vec![
-                ProtocolVersion::new(ProtocolVersion::V1_0_0),
-                ProtocolVersion::new(ProtocolVersion::V0_0_2_BETA),
-            ],
+            offered_versions: alloc::vec![ProtocolVersion::V1_0_0, ProtocolVersion::V0_0_2_BETA,],
             ack_timeout: Duration::from_secs(5),
             out_of_order: OutOfOrderPolicy::Report,
             skew_tolerance: Duration::from_secs(30),

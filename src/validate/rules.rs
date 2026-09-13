@@ -132,8 +132,8 @@ rules![
         "A resource that publishes costs should declare a currency",
         "`S2J messages/ResourceManagerDetails.currency`: \"Mandatory if cost information is published.\" Not stated is what counts as publishing it: the standard\'s own heat-pump walkthrough sends running_costs and transition_costs of zero while saying \"This heat pump does not define any costs related parameters, so no currency needs to be provided\" (erratum E17). Refusing that example would make this crate stricter than the documentation it implements, so it is a warning.";
     DUPLICATE_ROLE = "S2-RMD-003", Warning, false,
-        "A resource should declare one role per commodity",
-        "Not stated. Two roles for the same commodity leave a CEM with no way to choose between them.";
+        "A resource should declare each role once per commodity",
+        "`S2J messages/ResourceManagerDetails.roles` is \"one or more energy Roles\" bounded at `maxItems: 3` \u{2014} exactly the number of `RoleType` values, while `Commodity` has four. A cap of three cannot be counting commodities, so it is counting role types, and a battery that is storage, load *and* generator for electricity is saying so in the only way the schema allows (erratum E30). What this rule reports is therefore the narrow case the schema still cannot express: the same `(role, commodity)` pair twice, which carries no information either way. A warning rather than an error, for the same reason as `S2-ACT-002` \u{2014} the schema does not say the items are distinct.";
     NO_SELECTION_OFFERED = "S2-RMD-004", Warning, false,
         "NO_SELECTION is not something a resource can offer",
         "`S2J schemas/ControlType`: NO_SELECTION is \"to be used if no control type is or has been selected\" — a state, not a capability.";

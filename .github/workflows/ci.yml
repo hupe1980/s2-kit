@@ -142,6 +142,16 @@ jobs:
           }
           check std,uuid,connect-client,connect-server,tls-ring ring aws-lc-rs
           check std,uuid,connect-client,connect-server,tls-aws-lc-rs aws-lc-rs ring
+          # `tokio` alone is a TLS build too: the WebSocket driver dials `wss://`, and
+          # `rustls?/ring` reaches it only because `tokio` activates `dep:rustls` (D52).
+          check std,uuid,tokio,tls-ring ring aws-lc-rs
+          check std,uuid,tokio,tls-aws-lc-rs aws-lc-rs ring
+          # And the other direction: a plain dependency pulls no TLS at all.
+          for absent in rustls ring aws-lc-rs; do
+            ! has std,uuid,tls-ring "$absent" \
+              || { echo "::error::$absent linked into a default build"; exit 1; }
+          done
+          echo "std,uuid,tls-ring -> no TLS stack"
 
   # Features are not a matrix of two: fifteen of them are 32 768 combinations, and the
   # ones that fail to compile are always the ones nobody tried. `cargo hack` tries them.

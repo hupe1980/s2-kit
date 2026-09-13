@@ -1,6 +1,6 @@
 [package]
 name         = "s2-kit"
-version      = "0.2.0"
+version      = "0.3.0"
 edition      = "2024"
 rust-version = "1.94"
 authors      = ["hupe1980"]
@@ -33,12 +33,15 @@ chrono = ["dep:chrono"]
 # Derive JSON Schema from the Rust types, for the structural-equivalence check.
 schemars = ["dep:schemars", "std"]
 
-# Async drivers.
-tokio = ["std", "testing", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# Async drivers. TLS comes with them — S2 Connect requires `wss` — so `dep:rustls` is
+# activated here and not only by the `connect-*` features: `tls-ring` is `?`-gated and
+# reaches nothing otherwise (D52).
+tokio = ["std", "testing", "dep:tokio", "tokio-tungstenite/__rustls-tls", "dep:futures-util", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-platform-verifier"]
 
-# S2 Connect.
-connect-client = ["std", "tokio", "dep:reqwest", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-platform-verifier", "dep:url"]
-connect-server = ["std", "tokio", "dep:axum", "dep:tower", "dep:http", "dep:rcgen", "dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:if-addrs"]
+# S2 Connect. `rustls` and the platform verifier arrive with `tokio`; these add the HTTPS
+# client and the HTTPS server the two APIs run over.
+connect-client = ["std", "tokio", "dep:reqwest", "dep:url"]
+connect-server = ["std", "tokio", "dep:axum", "dep:tower", "dep:http", "dep:rcgen", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:if-addrs"]
 discovery = ["std", "dep:mdns-sd"]
 
 # The bundled TLS cryptography. Neither is required: an application that installs its own
@@ -75,7 +78,9 @@ chrono = { version = "0.4.45", default-features = false, optional = true }
 schemars = { version = "1.2.2", optional = true }
 
 tokio = { version = "1.53.1", features = ["rt", "time", "macros", "sync", "net"], optional = true }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+# No `rustls-tls-*-roots`: this crate supplies its own `Connector::Rustls`, so the library
+# never builds a `ClientConfig` and the bundled root list would go unread.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"], optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"], optional = true }
 
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"], optional = true }
@@ -146,7 +151,7 @@ required-features = ["std", "uuid"]
 
 [[test]]
 name = "model_matches_schema"
-required-features = ["std", "uuid"]
+required-features = ["std", "uuid", "testing"]
 
 [[test]]
 name = "connect_e2e"
@@ -155,6 +160,10 @@ required-features = ["connect-client", "connect-server"]
 [[test]]
 name = "vendoring"
 required-features = ["std"]
+
+# Invariants of this manifest itself. No features: it reads `Cargo.toml` as text.
+[[test]]
+name = "manifest"
 
 # Differential interoperability against the official crate.
 [[test]]

@@ -6,7 +6,9 @@
 //! Fix the Markdown, then re-run the generator.
 //!
 //! The module is `cfg(doctest)`, so it costs a normal build nothing: rustdoc is
-//! the only thing that ever compiles it.
+//! the only thing that ever compiles it. A block that needs a feature carries the
+//! `#[cfg]` for it, so `cargo test --doc` runs whatever the enabled features can
+//! actually compile and skips the rest.
 
 // Each carrier is named after the file and block it came from, so a failure names
 // the Markdown to fix. That is worth more here than the casing convention.
@@ -73,6 +75,7 @@ struct site_content_docs_getting_started_md_0;
 /// let acks = c.transcript().iter().filter(|e| e.kind == MessageKind::ReceptionStatus).count();
 /// assert_eq!(sent, acks);
 /// ```
+#[cfg(feature = "testing")]
 #[allow(non_snake_case, dead_code)]
 struct site_content_docs_getting_started_md_1;
 

@@ -160,12 +160,8 @@ async fn run(socket: Socket) -> Result<(), Box<dyn std::error::Error>> {
                 CemEvent::Status { kind, .. } => println!("status: {kind}"),
                 CemEvent::Measurement(_) => println!("measurement"),
                 CemEvent::Forecast(_) => println!("forecast"),
-                CemEvent::InstructionStatus {
-                    instruction_id,
-                    status,
-                    ..
-                } => {
-                    println!("instruction {instruction_id} is {status:?}");
+                CemEvent::InstructionStatus(u) => {
+                    println!("instruction {} is {:?}", u.instruction_id, u.status_type);
                     INSTRUCTED.fetch_add(1, Ordering::Relaxed);
                 }
                 CemEvent::Refused {

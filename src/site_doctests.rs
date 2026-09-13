@@ -8,6 +8,10 @@
 //! The module is `cfg(doctest)`, so it costs a normal build nothing: rustdoc is
 //! the only thing that ever compiles it.
 
+// Each carrier is named after the file and block it came from, so a failure names
+// the Markdown to fix. That is worth more here than the casing convention.
+#![allow(non_camel_case_types)]
+
 /// From [`site/content/_index.md`], block 0.
 ///
 /// ```

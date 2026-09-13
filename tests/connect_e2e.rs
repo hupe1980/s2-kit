@@ -1029,9 +1029,13 @@ async fn the_router_tracks_and_releases_pairing_attempts() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
 
-    // A client that fails at step 4 has already made the server record an attempt, and
-    // never reaches `finalizePairing` to release it. That one is held until its budget
-    // runs out and the next `remember` sweeps it.
+    // A client that fails at step 4 has already made the server record an attempt. It
+    // must hand that attempt back rather than leave it in flight: the rate limit is one
+    // attempt per node per second, and an attempt in flight occupies the slot for the
+    // whole fifteen-second budget, so every retry would be answered `503` for a quarter
+    // of a minute. `S2C` calls `finalizePairing { success: false }` a legitimate outcome
+    // for exactly this, and step 8 is reachable from a failure precisely because the
+    // client remembers the attempt id *before* it judges the server's answer.
     rm_client(&harness.base_url)
         .run(
             PairingCode::parse("hub7-WRONGTOKEN", TokenKind::Static).unwrap(),
@@ -1041,9 +1045,14 @@ async fn the_router_tracks_and_releases_pairing_attempts() {
         .expect_err("a wrong token cannot pair");
     assert_eq!(
         harness.endpoint.live_attempts(),
-        1,
-        "an abandoned attempt is held, to be swept when its budget runs out"
+        0,
+        "a client that gives up releases the attempt it started"
     );
+
+    // Which leaves the sweep for the case it is actually for (erratum E23): a client that
+    // vanishes without saying anything at all. Nothing here can make a well-behaved
+    // client do that, so expiry is unit-tested in `server::routes`; what matters e2e is
+    // that the ordinary failure path no longer *needs* the sweep.
 
     let _ = harness.shutdown.send(());
 }
@@ -1072,4 +1081,108 @@ async fn plain_http_is_refused_before_anything_is_sent() {
         endpoint_description(Deployment::Lan),
     );
     assert!(refused.is_err(), "S2 Connect is HTTPS only");
+}
+
+/// A pairing server is *not authenticated* while pairing, so whatever answers may lie
+/// about its size too.
+///
+/// `TlsPolicy::LanPairingOnly` means the four pairing requests are answered by whatever is
+/// on the other end of the socket — on a LAN, by anything that got there first. The server
+/// side has always bounded what an unauthenticated *client* may send (`MAX_BODY_BYTES`);
+/// nothing bounded what an unauthenticated *server* may answer, and `Response::text()`
+/// reads whatever arrives. A constrained Resource Manager is exactly the peer that cannot
+/// afford that.
+#[tokio::test]
+async fn an_endpoint_cannot_answer_a_pairing_request_with_a_gigabyte() {
+    use axum::routing::{get, post};
+
+    let identity = SelfSignedEndpoint::generate(["localhost".into()]).unwrap();
+    let config = identity.server_config().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("https://localhost:{port}/v1/");
+
+    // A "server" that answers every S2 Connect path with a body far past the cap. Valid
+    // JSON, 200 OK, and four megabytes of it.
+    let flood = || async {
+        let filler = "x".repeat(4 * 1024 * 1024);
+        axum::Json(serde_json::json!({ "pairingAttemptId": filler }))
+    };
+    let app = axum::Router::new()
+        .route("/v1/requestPairing", post(flood))
+        .route("/v1/nodes", get(flood));
+    let (shutdown, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = serve(listener, config, app, async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let code = PairingCode::parse("A1b2C3d4", TokenKind::Static).unwrap();
+    let client = Pairing::lan(
+        &base_url,
+        node("rm-1", Role::Rm, "Charger 9000"),
+        endpoint_description(Deployment::Lan),
+    )
+    .unwrap();
+    let error = client
+        .run(code, Timestamp::now())
+        .await
+        .expect_err("four megabytes is not an S2 Connect body");
+    assert!(
+        matches!(
+            error,
+            s2_kit::connect::client::Error::ResponseTooLarge { .. }
+        ),
+        "expected the size cap to fire, got {error:?}"
+    );
+    // And it is not reported as something worth retrying: the endpoint will answer the
+    // same way next time.
+    assert!(!error.is_transient());
+
+    let _ = shutdown.send(());
+}
+
+/// A pairing that fails must release the server's attempt, not sit on it.
+///
+/// The rate limit is one attempt per node per second, and an attempt *in flight* occupies
+/// that slot for the whole fifteen-second budget. So a client that gives up — a wrong
+/// code, a challenge that did not verify, a user who cancelled — and does not say so leaves
+/// the device refusing every retry with `503` for a quarter of a minute. `S2C` calls
+/// `finalizePairing { success: false }` a legitimate outcome precisely for this, and the
+/// driver had the method and never called it.
+#[tokio::test]
+async fn a_failed_pairing_releases_the_attempt_instead_of_holding_it() {
+    let harness = start().await;
+    harness.store.open_for_pairing(
+        harness.cem_node,
+        PairingToken::parse("A1b2C3d4", TokenKind::Static).unwrap(),
+    );
+
+    // The wrong token: `requestPairing` is answered (the server does not know yet), and
+    // the client then fails to verify the server's response in step 4.
+    let wrong = PairingCode::parse("hub7-WRONGTOKEN", TokenKind::Static).unwrap();
+    let failed = rm_client(&harness.base_url)
+        .run(wrong, Timestamp::now())
+        .await;
+    assert!(failed.is_err(), "the wrong token must not pair");
+
+    // The mandatory one-second delay still applies — that is the specification's own
+    // brute-force mitigation and it is not what this test is about. What must *not*
+    // happen is the attempt still being in flight, which would be `503` rather than a
+    // fresh attempt.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let good = PairingCode::parse("hub7-A1b2C3d4", TokenKind::Static).unwrap();
+    let paired = rm_client(&harness.base_url)
+        .run(good, Timestamp::now())
+        .await;
+    assert!(
+        paired.is_ok(),
+        "the next attempt must not be blocked by the abandoned one: {paired:?}"
+    );
+
+    let _ = harness.shutdown.send(());
 }

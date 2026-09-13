@@ -68,10 +68,25 @@ pub enum Error {
 }
 
 /// A two-way channel that carries S2 messages as text.
+///
+/// # `recv_text` must be cancel-safe
+///
+/// [`Driver::step`] races `recv_text` against a timer in a `select!`, so the future is
+/// dropped whenever the deadline or the keep-alive wins — which, on a quiet connection, is
+/// every single step. An implementation that has taken a message out of its source and is
+/// holding it in a local when it is dropped **loses that message**, silently, and the
+/// session it was feeding waits for an acknowledgement that was already delivered.
+///
+/// Both transports here are safe because their only await point is a single `next()`/
+/// `recv()` on a stream that is itself cancel-safe and yields the message atomically. An
+/// implementation that buffers, reassembles or decompresses across awaits must hold that
+/// state in `self`, not on the stack.
 pub trait TextTransport {
     /// Send one message.
     fn send_text(&mut self, text: String) -> impl Future<Output = Result<(), Error>> + Send;
     /// Wait for one message. `None` when the peer closed cleanly.
+    ///
+    /// Must be **cancel-safe**: see the trait's own documentation.
     fn recv_text(&mut self) -> impl Future<Output = Result<Option<String>, Error>> + Send;
     /// Send a keep-alive, if the transport has one.
     fn ping(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
@@ -82,6 +97,58 @@ pub trait TextTransport {
 /// A WebSocket, as S2 Connect specifies it.
 pub struct WebSocket<S> {
     stream: tokio_tungstenite::WebSocketStream<S>,
+}
+
+/// How to open a [`WebSocket`].
+///
+/// The one setting that is not a URL is the size cap, and it is here because it has to be
+/// applied at the handshake: a frame is fully buffered by the WebSocket library before any
+/// of this crate sees it, so a cap enforced afterwards by [`codec`](crate::codec) bounds
+/// what is *parsed* and not what is *held*. Left alone it is
+/// [`DecodeOptions::DEFAULT_MAX_BYTES`](crate::codec::DecodeOptions::DEFAULT_MAX_BYTES) —
+/// the same mebibyte the codec and the session engines use, so the default configuration
+/// is bounded end to end. Raise both together or neither.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct WebSocketOptions<'a> {
+    /// The bearer token, which under S2 Connect is the `websocketToken`.
+    pub bearer: Option<&'a str>,
+    /// The largest frame the transport will buffer. `None` is the codec's own default.
+    pub max_message_bytes: Option<usize>,
+    /// How to authenticate the server's certificate. `None` is the public PKI.
+    #[cfg(feature = "connect-client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+    pub policy: Option<&'a crate::connect::tls::TlsPolicy>,
+}
+
+impl<'a> WebSocketOptions<'a> {
+    /// With this bearer token.
+    #[must_use]
+    pub const fn bearer(mut self, bearer: &'a str) -> Self {
+        self.bearer = Some(bearer);
+        self
+    }
+
+    /// Buffer no frame larger than this.
+    #[must_use]
+    pub const fn max_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_message_bytes = Some(bytes);
+        self
+    }
+
+    /// Authenticate the server under this TLS policy.
+    #[cfg(feature = "connect-client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "connect-client")))]
+    #[must_use]
+    pub const fn policy(mut self, policy: &'a crate::connect::tls::TlsPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    fn limit(&self) -> usize {
+        self.max_message_bytes
+            .unwrap_or(crate::codec::DecodeOptions::DEFAULT_MAX_BYTES)
+    }
 }
 
 impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -95,7 +162,37 @@ impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     /// what makes it trustworthy is the CA pinned during pairing. Use
     /// [`connect_with_policy`](Self::connect_with_policy) there.
     pub async fn connect(url: &str, bearer: Option<&str>) -> Result<Self, Error> {
-        Self::dial(url, bearer, None).await
+        Self::open(
+            url,
+            &WebSocketOptions {
+                bearer,
+                ..WebSocketOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect with everything spelled out: bearer, size cap and TLS policy.
+    pub async fn open(url: &str, options: &WebSocketOptions<'_>) -> Result<Self, Error> {
+        #[cfg(feature = "connect-client")]
+        let connector = match options.policy {
+            None => None,
+            Some(policy) => {
+                // A session must never run unauthenticated: the pairing-only policy exists
+                // for the four pairing requests and nothing else.
+                if !policy.authenticates() {
+                    return Err(Error::Transport(
+                        "a session must not run under the pairing-only TLS policy".to_string(),
+                    ));
+                }
+                let client = crate::connect::tls::TlsClient::new(policy)
+                    .map_err(|e| Error::Transport(e.to_string()))?;
+                Some(tokio_tungstenite::Connector::Rustls(client.config()))
+            }
+        };
+        #[cfg(not(feature = "connect-client"))]
+        let connector = None;
+        Self::dial(url, options.bearer, connector, options.limit()).await
     }
 
     /// Connect under a [`TlsPolicy`](crate::connect::tls::TlsPolicy) — which, after a LAN
@@ -123,23 +220,22 @@ impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
         bearer: Option<&str>,
         policy: &crate::connect::tls::TlsPolicy,
     ) -> Result<Self, Error> {
-        // A session must never run unauthenticated: the pairing-only policy exists for
-        // the four pairing requests and nothing else.
-        if !policy.authenticates() {
-            return Err(Error::Transport(
-                "a session must not run under the pairing-only TLS policy".to_string(),
-            ));
-        }
-        let client = crate::connect::tls::TlsClient::new(policy)
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let connector = tokio_tungstenite::Connector::Rustls(client.config());
-        Self::dial(url, bearer, Some(connector)).await
+        Self::open(
+            url,
+            &WebSocketOptions {
+                bearer,
+                policy: Some(policy),
+                ..WebSocketOptions::default()
+            },
+        )
+        .await
     }
 
     async fn dial(
         url: &str,
         bearer: Option<&str>,
         connector: Option<tokio_tungstenite::Connector>,
+        max_message_bytes: usize,
     ) -> Result<Self, Error> {
         let mut request = url
             .into_client_request()
@@ -150,10 +246,22 @@ impl WebSocket<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
                 .map_err(|_| Error::Transport("invalid bearer token".to_string()))?;
             request.headers_mut().insert("Authorization", value);
         }
-        let (stream, _) =
-            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
-                .await
-                .map_err(|e| Error::Transport(e.to_string()))?;
+        // The cap has to be here rather than only in the codec: by the time `decode`
+        // measures a frame, the library has already buffered every byte of it. The
+        // library's own defaults are 64 MiB per message and 16 MiB per frame, which is
+        // sixty-four megabytes an unauthenticated peer can make a gateway hold before
+        // anything of this crate's runs.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(max_message_bytes))
+            .max_frame_size(Some(max_message_bytes));
+        let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            Some(config),
+            false,
+            connector,
+        )
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))?;
         Ok(Self { stream })
     }
 }

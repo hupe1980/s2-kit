@@ -42,8 +42,12 @@ one exists because three things are missing from the ecosystem as a whole.
 **📐 A model that is provably the wire.** `s2energy` generates its types with `typify` from a
 *modified* copy of the schema, and the modification matters: it declares `ID` as
 `format: uuid` although both tagged versions of S2 JSON define it as the pattern
-`[a-zA-Z0-9\-_:]{2,64}`. The result rejects every identifier in the standard's own worked
-examples — `"actuator1"`, `"om1"` — and every conforming peer that does not use UUIDs.
+`[a-zA-Z0-9\-_:]{2,64}`. That is not an argument — `s2energy` is a dev-dependency here, and
+a test links it and counts:
+
+> **The official crate refuses 25 of the 43 messages in the standard's own published
+> walkthroughs**, all with "UUID parsing failed". `s2-kit` reads all 43.
+
 `s2-kit`'s types are hand-written and **proven** against the official schemas in CI, in
 both directions: every message is validated by a real JSON Schema validator, and every
 property the schema defines must exist in the Rust type.
@@ -51,11 +55,13 @@ property the schema defines must exist in the Rust type.
 **⚙️ A protocol engine.** Every existing implementation stops at "parse, acknowledge,
 dispatch". The state table, revocation, validity windows, timers and instruction
 lifecycles are left to each application to rebuild. `s2-kit` ships them, for both roles,
-sans-I/O.
+sans-I/O — including the row the standard's own table leaves out: until a bare-WebSocket
+session has finished its handshake, neither side has agreed which schema the next message
+is to be read against, so nothing but the handshake crosses.
 
 **📋 Conformance.** The official certification-tool repository contains a licence file and
 nothing else; the S2 Analyzer validates only against the schema. `s2-kit` has a
-[rule catalogue](https://hupe1980.github.io/s2-kit/reference/rules/) of 61 numbered
+[rule catalogue](https://hupe1980.github.io/s2-kit/reference/rules/) of 65 numbered
 semantic rules, each quoting the sentence it implements and each with a test that fires
 it — and an `Analyzer` that runs all of them over a whole recorded conversation.
 
@@ -105,9 +111,13 @@ description that was sent earlier. `s2-kit` does it once, and says when an instr
 
 ```text
 FRBC.Instruction instr0 on actuator1 → Charging (charge) at factor 0.6,
-  ElectricPower3PhaseSymmetric 3000 W, filling at 0.0015/s
+  ELECTRIC.POWER.3_PHASE_SYMMETRIC 3000 W, filling at 0.0015/s
   ; blocked by Minimum discharge time (cooldown)
 ```
+
+The unit comes from the quantity, not from a hard-coded `W`: four of the ten
+`CommodityQuantity` values are litres, grams or degrees Celsius, and one of them is not a
+power at all.
 
 **🔍 Rule identifiers on the wire.** Every failing `ReceptionStatus` carries the rule that
 failed, so a refusal is greppable across a fleet rather than a mystery:
@@ -116,6 +126,16 @@ failed, so a refusal is greppable across a fleet rather than a mystery:
 {"message_type":"ReceptionStatus","subject_message_id":"mx","status":"INVALID_CONTENT",
  "diagnostic_label":"S2-FRBC-003 at /actuator_id: nope is not an actuator of this system"}
 ```
+
+And where a mistake is common, the sentence names it. This is a real refusal, from the
+first run against the official example battery:
+
+```text
+S2-INST-002 at /instruction_id: 8dd19d29-… is the message_id of the instruction whose
+id is 2161b5a9-…; instruction_id must be the instruction's own id
+```
+
+The peer is handed the field to change rather than a status code to reverse-engineer.
 
 **⏱️ A whole fleet on one timer.** Both roles satisfy one `Session` trait, and a `SessionSet`
 answers the only question an event loop has: when must I next wake, and for whom. Each
@@ -149,7 +169,7 @@ connect::proto ─────────────────────�
 ```
 
 **🔬 `no_std + alloc`.** The core — cryptography included — builds for
-`wasm32-unknown-unknown` and `thumbv7em-none-eabihf`, and 178 of its unit tests run there.
+`wasm32-unknown-unknown` and `thumbv7em-none-eabihf`, and 202 of its unit tests run there.
 
 **⚖️ Representable is not valid.** A factor of 1.3 and a 289-element forecast are both
 representable, because a proxy has to carry a message it would refuse to send. The types
@@ -159,9 +179,14 @@ accept what the schema accepts; the validator judges; the builders refuse.
 conversions to `jiff`, `time` and `chrono` behind features, and each crate re-exported so
 a caller can always name the version this crate was built against.
 
-**🔀 Both wire profiles.** The deployed ecosystem negotiates `"0.0.2-beta"` while the schemas
-are tagged `v1.0.0`. They differ in exactly one place — DDBC's present demand rate moved
-from a field to a message — so `s2-kit` speaks both and enforces whichever was negotiated.
+**🔀 Both wire profiles.** `v1.0.0` is a git tag that no shipping implementation negotiates:
+`s2-python` hard-codes `0.0.2-beta`, so does `s2-ruby`, so do both reference
+implementations, and so does the official Rust crate's own build script. A v1.0.0-only
+library would interoperate with nobody. The two tags are byte-identical apart from DDBC —
+the present demand rate moved from a field to a message — so for four of the five control
+types the beta profile *is* the v1.0.0 profile, and supporting it is one more string in a
+list. `s2-kit` speaks both, offers v1.0.0 first, and enforces whichever was negotiated in
+both directions.
 Negotiation is an exact string match, never a semver range — with one deliberate latitude:
 the two specifications spell the *same* version differently (S2 Connect requires `v1.0.0`,
 every S2 JSON handshake writes `1.0.0`, and the one other Rust implementation's examples
@@ -193,12 +218,12 @@ $ cargo install s2-kit --features cli
 
 $ s2-kit validate message.json
 message 1: S2-NUM-004 at /operation_mode_factor: operation mode factor 1.3 is outside [0, 1]
-1 message(s) checked against 61 rules: FAILED
+1 message(s) checked against 65 rules: FAILED
 
 $ s2-kit replay session.s2log
    4 cem>rm FRBC.Instruction: S2-FRBC-003 at /actuator_id: nope is not an actuator of this system
    7 rm>cem FRBC.StorageStatus: never answered; no ReceptionStatus names m7
-12 line(s), 9 answered, checked against 61 rules: FAILED
+12 line(s), 9 answered, checked against 65 rules: FAILED
 ```
 
 `validate` judges each message alone. `replay` drives a recorded conversation through
@@ -211,11 +236,12 @@ message.
 
 ## ✅ Status
 
-**Not yet published.** Both specifications are implemented end to end — S2 JSON with its
-two session engines, and S2 Connect from DNS-SD through pairing to an authorised
-WebSocket. What remains is interoperability runs against other implementations.
+Both specifications are implemented end to end — S2 JSON with its two session engines, and
+S2 Connect from DNS-SD through pairing to an authorised WebSocket. Pre-1.0, so a minor bump
+may break the API; rule identifiers and the errata numbers cited from the code do not
+change meaning.
 
-Verified on every commit: **360 tests** (193 of them under `no_std`), zero clippy warnings
+Verified on every commit: **384 tests** (202 of them under `no_std`), zero clippy warnings
 at `pedantic` on every configuration built, the feature powerset to depth 2, `wasm32`,
 `thumbv7em` and `riscv32imac` builds, rustdoc with warnings denied, `cargo deny`, and
 seven fuzz targets nightly.
@@ -240,14 +266,23 @@ seven fuzz targets nightly.
   not return the range's own endpoint — the number both roles compare against.
 * 🧪 **Fuzzing where it matters most.** Seven targets, including the S2 Connect request
   bodies, which an *unauthenticated* peer reaches before any secret has been checked.
+* 🔗 **Differential against the official crate.** `s2energy` is a dev-dependency: the 35
+  messages of `0.0.2-beta` are encoded here, re-encoded through *its* model and read back.
+  That is the only profile anything else speaks — nothing implements `v1.0.0`, so the two
+  messages the tags disagree about rest on the official schema alone.
+* 🤝 **Interoperability, not self-agreement.** `cargo xtask interop` builds the official
+  example Resource Managers and talks to them over a real WebSocket. Five defects across
+  both suites are caught and pinned, so the job goes red only when this crate regresses or
+  a peer is fixed.
 * 🧱 **Bounded where it counts.** Everything an unauthenticated caller picks the size of has
   a named cap — the body, the pairing token, the node alias, the lenient decoder's
   recursion, and the long-polling table — and the last two are proved across a real HTTP
-  boundary.
+  boundary. The frame cap is applied at the **WebSocket handshake**, not only at the
+  parser: by the time a decoder measures a frame, the library has buffered all of it.
 
 ## 🐛 Errata
 
-Implementing a standard carefully means finding its rough edges. Twenty-six are recorded
+Implementing a standard carefully means finding its rough edges. Twenty-nine are recorded
 with how each is handled — among them an `ID` documented as a UUID and defined as a
 pattern that is not one, two control-type descriptions that are swapped, `NOT_CONTROLABLE`
 and `supported_commodites` misspelled on the wire, a pairing rate limit that bounds online

@@ -20,7 +20,9 @@ mod table;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub use table::TYPES;
+pub use table::{BETA_TYPES, TYPES};
+
+use crate::types::WireProfile;
 
 /// The `minItems` and `maxItems` an array property carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +54,20 @@ impl ArrayBounds {
 pub enum Kind {
     /// A number, string, boolean or enumeration.
     Scalar,
+    /// An S2 [`Id`](crate::types::Id).
+    ///
+    /// A scalar as far as the decoder is concerned, and distinguished here because a tool
+    /// that walks a message often wants to *follow* identifiers: to rewrite them, to link
+    /// them, to see which of them a message introduces. Telling them apart by property
+    /// name would be a hand-maintained list of forty-odd spellings, which is the thing
+    /// this table exists to avoid.
+    Id,
     /// Another object type, named here so a walk can recurse into it.
     Object(&'static str),
     /// An array of scalars.
     ScalarArray(ArrayBounds),
+    /// An array of [`Id`](crate::types::Id)s.
+    IdArray(ArrayBounds),
     /// An array of another object type.
     ObjectArray(&'static str, ArrayBounds),
 }
@@ -65,9 +77,15 @@ impl Kind {
     #[must_use]
     pub const fn bounds(self) -> Option<ArrayBounds> {
         match self {
-            Kind::ScalarArray(b) | Kind::ObjectArray(_, b) => Some(b),
-            Kind::Scalar | Kind::Object(_) => None,
+            Kind::ScalarArray(b) | Kind::IdArray(b) | Kind::ObjectArray(_, b) => Some(b),
+            Kind::Scalar | Kind::Id | Kind::Object(_) => None,
         }
+    }
+
+    /// Whether this property holds one or more S2 identifiers.
+    #[must_use]
+    pub const fn is_id(self) -> bool {
+        matches!(self, Kind::Id | Kind::IdArray(_))
     }
 }
 
@@ -110,6 +128,27 @@ pub fn type_spec(name: &str) -> Option<&'static TypeSpec> {
         .and_then(|i| TYPES.get(i))
 }
 
+/// The specification for a type as a given wire profile defines it.
+///
+/// The two tagged versions of S2 JSON differ in exactly one type, so this is an overlay
+/// with a fall-through rather than two tables: [`BETA_TYPES`] first when the profile is
+/// `v0.0.2-beta`, [`TYPES`] otherwise and as the fallback.
+///
+/// Using this rather than [`type_spec`] is what keeps a lenient decoder from pruning
+/// `DDBC.SystemDescription.present_demand_rate` — a **required** property of that
+/// profile, and absent from `v1.0.0` — out of a message and then refusing it for the
+/// field it just removed.
+#[must_use]
+pub fn type_spec_in(profile: WireProfile, name: &str) -> Option<&'static TypeSpec> {
+    match profile {
+        WireProfile::V0_0_2Beta => BETA_TYPES
+            .iter()
+            .find(|t| t.name == name)
+            .or_else(|| type_spec(name)),
+        WireProfile::V1_0_0 => type_spec(name),
+    }
+}
+
 /// The specification for a message, by its `message_type`.
 #[must_use]
 pub fn message_spec(message_type: &str) -> Option<&'static TypeSpec> {
@@ -145,14 +184,16 @@ pub const MAX_PRUNE_DEPTH: usize = 16;
 pub fn prune_unknown(
     value: &mut serde_json::Value,
     type_name: &str,
+    profile: WireProfile,
     removed: &mut Vec<String>,
 ) -> usize {
-    prune_at(value, type_name, "", removed, MAX_PRUNE_DEPTH)
+    prune_at(value, type_name, profile, "", removed, MAX_PRUNE_DEPTH)
 }
 
 fn prune_at(
     value: &mut serde_json::Value,
     type_name: &str,
+    profile: WireProfile,
     path: &str,
     removed: &mut Vec<String>,
     depth: usize,
@@ -160,7 +201,7 @@ fn prune_at(
     let Some(depth) = depth.checked_sub(1) else {
         return 0;
     };
-    let Some(spec) = type_spec(type_name) else {
+    let Some(spec) = type_spec_in(profile, type_name) else {
         return 0;
     };
     let Some(object) = value.as_object_mut() else {
@@ -186,17 +227,17 @@ fn prune_at(
         let child_path = alloc::format!("{path}/{}", property.name);
         match property.kind {
             Kind::Object(inner) => {
-                count += prune_at(child, inner, &child_path, removed, depth);
+                count += prune_at(child, inner, profile, &child_path, removed, depth);
             }
             Kind::ObjectArray(inner, _) => {
                 if let Some(items) = child.as_array_mut() {
                     for (i, item) in items.iter_mut().enumerate() {
                         let item_path = alloc::format!("{child_path}/{i}");
-                        count += prune_at(item, inner, &item_path, removed, depth);
+                        count += prune_at(item, inner, profile, &item_path, removed, depth);
                     }
                 }
             }
-            Kind::Scalar | Kind::ScalarArray(_) => {}
+            Kind::Scalar | Kind::Id | Kind::ScalarArray(_) | Kind::IdArray(_) => {}
         }
     }
     count
@@ -218,6 +259,73 @@ mod tests {
         let mut from_rust: Vec<&str> = MessageKind::ALL.iter().map(|k| k.as_str()).collect();
         from_rust.sort_unstable();
         assert_eq!(from_schema, from_rust);
+    }
+
+    #[test]
+    fn the_beta_overlay_is_the_one_place_the_two_tags_differ() {
+        // Every type the overlay names must also exist in the main table, and must differ
+        // from it — an overlay entry that is identical is dead weight that hides the one
+        // real difference.
+        for spec in BETA_TYPES {
+            let base = type_spec(spec.name).expect("an overlay type the main table lacks");
+            assert_ne!(
+                base.properties, spec.properties,
+                "{} is in the overlay but identical to v1.0.0",
+                spec.name
+            );
+        }
+        // And the difference is a *property*, never an array bound: `check_array` reads
+        // the main table alone, which is only sound while that stays true.
+        for spec in BETA_TYPES {
+            let base = type_spec(spec.name).expect("an overlay type");
+            for property in spec.properties {
+                if let Some(same) = base.property(property.name) {
+                    assert_eq!(
+                        same.kind.bounds(),
+                        property.kind.bounds(),
+                        "{}/{} has different array bounds per profile",
+                        spec.name,
+                        property.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_property_a_profile_requires_is_not_pruned_out_of_it() {
+        // The bug this pins: the property table is v1.0.0's, and
+        // `DDBC.SystemDescription.present_demand_rate` is *required* in `0.0.2-beta` and
+        // absent from v1.0.0. Pruning a beta message against the v1.0.0 table removed the
+        // required field and the typed decode then refused the message for missing it —
+        // so an analyzer could not read a conforming beta transcript at all.
+        let text = r#"{"message_type":"DDBC.SystemDescription","message_id":"m1",
+            "valid_from":"2019-08-24T14:15:22Z","actuators":[],
+            "present_demand_rate":{"start_of_range":0.0,"end_of_range":1.0},
+            "provides_average_demand_rate_forecast":false,"vendor":1}"#;
+
+        let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let mut removed = Vec::new();
+        let n = prune_unknown(
+            &mut value,
+            "DDBC.SystemDescription",
+            WireProfile::V0_0_2Beta,
+            &mut removed,
+        );
+        assert_eq!(n, 1, "only the vendor extension should go");
+        assert_eq!(removed, alloc::vec!["/vendor".to_string()]);
+        assert!(value.get("present_demand_rate").is_some());
+
+        // And against v1.0.0 it *is* unknown, because that tag removed it.
+        let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let mut removed = Vec::new();
+        prune_unknown(
+            &mut value,
+            "DDBC.SystemDescription",
+            WireProfile::V1_0_0,
+            &mut removed,
+        );
+        assert!(removed.contains(&"/present_demand_rate".to_string()));
     }
 
     #[test]
@@ -290,7 +398,12 @@ mod tests {
         )
         .unwrap();
         let mut removed = Vec::new();
-        let n = prune_unknown(&mut value, "FRBC.ActuatorStatus", &mut removed);
+        let n = prune_unknown(
+            &mut value,
+            "FRBC.ActuatorStatus",
+            WireProfile::V1_0_0,
+            &mut removed,
+        );
         assert_eq!(n, 1);
         assert_eq!(removed, alloc::vec!["/vendor_extension".to_string()]);
         assert!(value.get("vendor_extension").is_none());
@@ -324,7 +437,12 @@ mod tests {
         .unwrap();
         let mut removed = Vec::new();
         assert_eq!(
-            prune_unknown(&mut value, "PPBC.PowerProfileDefinition", &mut removed),
+            prune_unknown(
+                &mut value,
+                "PPBC.PowerProfileDefinition",
+                WireProfile::V1_0_0,
+                &mut removed
+            ),
             1
         );
         assert_eq!(
@@ -360,7 +478,12 @@ mod tests {
         )
         .unwrap();
         let mut removed = Vec::new();
-        let n = prune_unknown(&mut value, "FRBC.SystemDescription", &mut removed);
+        let n = prune_unknown(
+            &mut value,
+            "FRBC.SystemDescription",
+            WireProfile::V1_0_0,
+            &mut removed,
+        );
         assert_eq!(n, 3, "{removed:?}");
         removed.sort();
         assert_eq!(

@@ -47,6 +47,12 @@ pub struct Endpoint {
     /// What this endpoint has to tell nodes that are long-polling it.
     long_poll: Arc<LongPoll>,
     clock: fn() -> Timestamp,
+    /// The largest WebSocket frame this endpoint will buffer.
+    ///
+    /// Here rather than on the route because it is the *endpoint's* budget: the same
+    /// number the codec and the session engine use, applied where it bounds memory rather
+    /// than where it bounds parsing.
+    max_message_bytes: usize,
     /// What to do when a client says the user has started pairing on their side.
     on_prepare: Option<Arc<dyn Fn(PrepareSignal) + Send + Sync>>,
 }
@@ -97,8 +103,28 @@ impl Endpoint {
             attempts: Arc::new(std::sync::Mutex::new(Vec::new())),
             long_poll: Arc::new(LongPoll::default()),
             clock: Timestamp::now,
+            max_message_bytes: crate::codec::DecodeOptions::DEFAULT_MAX_BYTES,
             on_prepare: None,
         }
+    }
+
+    /// Buffer no WebSocket frame larger than this.
+    ///
+    /// Defaults to
+    /// [`DecodeOptions::DEFAULT_MAX_BYTES`](crate::codec::DecodeOptions::DEFAULT_MAX_BYTES),
+    /// the mebibyte the codec and the session engines already use. Raise it only together
+    /// with the session's own `max_message_bytes`: a frame larger than the codec will
+    /// parse is a frame that is buffered and then refused.
+    #[must_use]
+    pub const fn with_max_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_message_bytes = bytes;
+        self
+    }
+
+    /// The largest WebSocket frame this endpoint will buffer.
+    #[must_use]
+    pub const fn max_message_bytes(&self) -> usize {
+        self.max_message_bytes
     }
 
     /// React to a client announcing that its user has started pairing.

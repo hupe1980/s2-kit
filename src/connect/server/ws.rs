@@ -166,7 +166,13 @@ where
     };
     crate::trace::event!(info, node = %node, "accepted an S2 WebSocket");
     let handler = state.handler.clone();
-    upgrade.on_upgrade(move |socket| async move {
-        handler(node, ServerSocket::new(socket)).await;
-    })
+    // The same cap the codec applies, applied where it actually bounds memory: by the
+    // time `decode` measures a frame, axum has buffered every byte of it. Without this
+    // the default ceiling is axum's, not this crate's.
+    upgrade
+        .max_message_size(state.endpoint.max_message_bytes())
+        .max_frame_size(state.endpoint.max_message_bytes())
+        .on_upgrade(move |socket| async move {
+            handler(node, ServerSocket::new(socket)).await;
+        })
 }

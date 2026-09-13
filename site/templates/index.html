@@ -10,5 +10,9 @@
   <pre class="install"><code>cargo add s2-kit</code></pre>
 </section>
 
+{#- The same wrapper every other page gets: `<main>` carries no gutter and no measure, and
+    `.grid` sets `max-width: none` because it expects to sit inside this. -#}
+<div class="prose">
 {{ section.content | safe }}
+</div>
 {% endblock content %}

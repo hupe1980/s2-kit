@@ -53,6 +53,14 @@ pub struct Explanation {
     pub blocked_by: Vec<(Id, Option<String>)>,
     /// Whether it uses something marked `abnormal_condition_only` without saying so.
     pub abnormal_only_misuse: bool,
+    /// Why the instruction could not be read against the description, if it could not.
+    ///
+    /// An instruction naming an actuator nobody described, an operation mode that
+    /// actuator does not have, or a factor outside `[0, 1]` has no power, no fill rate
+    /// and no transition — and an [`Explanation`] that merely left those empty would be
+    /// indistinguishable from one for an instruction that genuinely asks for zero watts.
+    /// [`is_actionable`](Self::is_actionable) is false whenever this is set.
+    pub unresolved: Option<super::ResolveError>,
     /// Anything else worth saying in a log line.
     pub notes: Vec<String>,
 }
@@ -62,7 +70,7 @@ impl Explanation {
     /// can tell.
     #[must_use]
     pub fn is_actionable(&self) -> bool {
-        self.blocked_by.is_empty() && !self.abnormal_only_misuse
+        self.unresolved.is_none() && self.blocked_by.is_empty() && !self.abnormal_only_misuse
     }
 
     /// The electrical power the instruction implies, if it names one.
@@ -93,7 +101,15 @@ impl core::fmt::Display for Explanation {
             write!(f, " at factor {factor}")?;
         }
         for value in &self.power {
-            write!(f, ", {:?} {} W", value.commodity_quantity, value.value)?;
+            // The unit from the quantity, not a hard-coded `W`: four of the ten
+            // quantities are litres, grams or degrees, and one of them is not a power.
+            write!(
+                f,
+                ", {} {} {}",
+                value.commodity_quantity.as_str(),
+                value.value,
+                value.commodity_quantity.unit()
+            )?;
         }
         if let Some(rate) = self.fill_rate {
             write!(f, ", filling at {rate}/s")?;
@@ -104,8 +120,11 @@ impl core::fmt::Display for Explanation {
         for (quantity, limits) in &self.limits {
             write!(
                 f,
-                ", {:?} bounded to {}..{}",
-                quantity, limits.lower, limits.upper
+                ", {} bounded to {}..{} {}",
+                quantity.as_str(),
+                limits.lower,
+                limits.upper,
+                quantity.unit()
             )?;
         }
         if let Some((_, _, sequence, duration)) = &self.sequence {
@@ -119,6 +138,9 @@ impl core::fmt::Display for Explanation {
                 Some(label) => write!(f, "; blocked by {label} ({timer})")?,
                 None => write!(f, "; blocked by {timer}")?,
             }
+        }
+        if let Some(why) = &self.unresolved {
+            write!(f, "; unresolved: {why}")?;
         }
         if self.abnormal_only_misuse {
             write!(
@@ -156,6 +178,7 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
         transition_duration: Duration::ZERO,
         blocked_by: Vec::new(),
         abnormal_only_misuse: false,
+        unresolved: None,
         notes: Vec::new(),
     };
 
@@ -168,6 +191,7 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
             let Some(system) = ctx.frbc else {
                 e.notes
                     .push("no FRBC.SystemDescription has been seen".into());
+                e.unresolved = Some(super::ResolveError::NotDescribed);
                 return Some(e);
             };
             match resolve_frbc(system, i, ctx.fill_level) {
@@ -197,7 +221,10 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
                         &r.actuator.timers,
                     );
                 }
-                Err(err) => e.notes.push(err.to_string()),
+                Err(err) => {
+                    e.notes.push(err.to_string());
+                    e.unresolved = Some(err);
+                }
             }
         }
         Message::OmbcInstruction(i) => {
@@ -207,6 +234,7 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
             let Some(system) = ctx.ombc else {
                 e.notes
                     .push("no OMBC.SystemDescription has been seen".into());
+                e.unresolved = Some(super::ResolveError::NotDescribed);
                 return Some(e);
             };
             match resolve_ombc(system, i) {
@@ -223,7 +251,10 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
                         &system.timers,
                     );
                 }
-                Err(err) => e.notes.push(err.to_string()),
+                Err(err) => {
+                    e.notes.push(err.to_string());
+                    e.unresolved = Some(err);
+                }
             }
         }
         Message::DdbcInstruction(i) => {
@@ -234,6 +265,7 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
             let Some(system) = ctx.ddbc else {
                 e.notes
                     .push("no DDBC.SystemDescription has been seen".into());
+                e.unresolved = Some(super::ResolveError::NotDescribed);
                 return Some(e);
             };
             match resolve_ddbc(system, i) {
@@ -251,7 +283,10 @@ pub fn explain(message: &Message, ctx: &Context<'_>) -> Option<Explanation> {
                         &r.actuator.timers,
                     );
                 }
-                Err(err) => e.notes.push(err.to_string()),
+                Err(err) => {
+                    e.notes.push(err.to_string());
+                    e.unresolved = Some(err);
+                }
             }
         }
         Message::PebcInstruction(i) => {
@@ -372,6 +407,96 @@ fn note_sequence(e: &mut Explanation, ctx: &Context<'_>, profile: Id, container:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_instruction_that_did_not_resolve_is_not_actionable() {
+        use super::*;
+        use crate::model::ResolveError;
+        use crate::types::common::{Commodity, NumberRange, PowerRange};
+        use crate::types::frbc;
+        use alloc::vec;
+
+        // `is_actionable` used to mean "nothing is blocking it", which is true of an
+        // instruction whose actuator nobody described — it has no transitions, so nothing
+        // can block it. An application that asked the question got `true` and an empty
+        // `power`, which is indistinguishable from an instruction that genuinely asks for
+        // zero watts.
+        let system = frbc::SystemDescription {
+            message_id: Id::new_const("m1"),
+            valid_from: Timestamp::UNIX_EPOCH,
+            actuators: vec![frbc::ActuatorDescription {
+                id: Id::new_const("actuator1"),
+                diagnostic_label: None,
+                supported_commodities: vec![Commodity::Electricity],
+                operation_modes: vec![frbc::OperationMode {
+                    id: Id::new_const("om1"),
+                    diagnostic_label: None,
+                    elements: vec![frbc::OperationModeElement {
+                        fill_level_range: NumberRange::new(0.0, 100.0),
+                        fill_rate: NumberRange::new(0.0, 0.002),
+                        power_ranges: vec![PowerRange::new(
+                            0.0,
+                            5000.0,
+                            CommodityQuantity::ElectricPower3PhaseSymmetric,
+                        )],
+                        running_costs: None,
+                    }],
+                    abnormal_condition_only: false,
+                }],
+                transitions: vec![],
+                timers: vec![],
+            }],
+            storage: frbc::StorageDescription {
+                diagnostic_label: None,
+                fill_level_label: None,
+                provides_leakage_behaviour: false,
+                provides_fill_level_target_profile: false,
+                provides_usage_forecast: false,
+                fill_level_range: NumberRange::new(0.0, 100.0),
+            },
+        };
+        let ctx = Context {
+            frbc: Some(&system),
+            ..Context::empty()
+        };
+        let instruct = |actuator: &'static str, factor: f64| {
+            Message::from(frbc::Instruction {
+                message_id: Id::new_const("m2"),
+                id: Id::new_const("i1"),
+                actuator_id: Id::new_const(actuator),
+                operation_mode: Id::new_const("om1"),
+                operation_mode_factor: factor,
+                execution_time: Timestamp::UNIX_EPOCH,
+                abnormal_condition: false,
+            })
+        };
+
+        // The happy case still is actionable.
+        let good = explain(&instruct("actuator1", 0.5), &ctx).expect("an instruction");
+        assert!(good.unresolved.is_none());
+        assert!(good.is_actionable());
+        assert!(!good.power.is_empty());
+
+        // An actuator nobody described.
+        let ghost = explain(&instruct("ghost", 0.5), &ctx).expect("an instruction");
+        assert_eq!(
+            ghost.unresolved,
+            Some(ResolveError::UnknownActuator(Id::new_const("ghost")))
+        );
+        assert!(!ghost.is_actionable());
+        assert!(ghost.power.is_empty());
+        assert!(ghost.to_string().contains("unresolved"));
+
+        // A factor the arithmetic cannot use.
+        let bad = explain(&instruct("actuator1", 1.3), &ctx).expect("an instruction");
+        assert_eq!(bad.unresolved, Some(ResolveError::BadFactor(1.3)));
+        assert!(!bad.is_actionable());
+
+        // And no description at all is its own answer, not a silently empty one.
+        let blind = explain(&instruct("actuator1", 0.5), &Context::empty()).expect("one");
+        assert_eq!(blind.unresolved, Some(ResolveError::NotDescribed));
+        assert!(!blind.is_actionable());
+    }
+
     use super::*;
     use crate::types::common::{Commodity, NumberRange, PowerRange, Transition};
     use crate::types::frbc;

@@ -103,6 +103,10 @@ rules![
         "A field that is optional in general is mandatory for this sender's role",
         "`S2J messages/Handshake.supported_protocol_versions`: \"This field is mandatory for the RM, but optional for the CEM.\" The schema cannot express a requirement that depends on another field's value, so it lists the property as optional and says the rest in prose.";
 
+    PROFILE_FIELD = "S2-MSG-008", Error, true,
+        "A field must be present exactly when the negotiated wire profile defines it",
+        "`S2C §Versioning of JSON Schema files`: the negotiated version selects which schema the messages are read against, and the two tagged versions of S2 JSON differ in one field — `DDBC.SystemDescription.present_demand_rate` is required in `v0.0.2-beta` and was removed in `v1.0.0`, where `DDBC.PresentDemandStatus` carries it instead (erratum E13). The decoder already refuses the wrong shape on the way in; this is the same rule applied on the way *out*, so an endpoint learns at the call site rather than from the peer's `INVALID_MESSAGE`.";
+
     // --- measurements and forecasts --------------------------------------
     ONE_VALUE_PER_QUANTITY = "S2-PM-001", Error, false,
         "At most one value per CommodityQuantity",
@@ -159,6 +163,9 @@ rules![
     PREVIOUS_MODE_MISSING = "S2-STATUS-001", Warning, true,
         "A status after the first for the same actuator should name the previous mode",
         "`S2J messages/FRBC.ActuatorStatus.previous_operation_mode_id`: \"This value shall always be provided, unless the active FRBC.OperationMode is the first FRBC.OperationMode the Resource Manager is aware of.\" OMBC.Status and DDBC.ActuatorStatus carry the same field with the same sentence, so this is one rule rather than three — and \"the first the Resource Manager is aware of\" is per actuator, not per session.";
+    UNKNOWN_TIMER = "S2-STATUS-002", Error, true,
+        "A timer status must name a timer the description declares",
+        "`S2J schemas/Timer.id`: an identifier is \"unique in the scope of the OMBC.SystemDescription, FRBC.ActuatorDescription or DDBC.ActuatorDescription in which it is used\", so a `*.TimerStatus` naming a timer no description declares refers to nothing. Its own identifier rather than the transition rule's, because a `diagnostic_label` is worth having only if one identifier means one condition (D28) — and \"this transition points at a timer that does not exist\" and \"you are reporting on a timer that does not exist\" are two conditions an operator counts separately.";
 
     // --- instructions -----------------------------------------------------
     DUPLICATE_INSTRUCTION_ID = "S2-INST-001", Error, true,
@@ -248,11 +255,17 @@ rules![
         "A profile status must cover every container of the profile",
         "`S2J messages/PPBC.PowerProfileStatus.sequence_container_status`: \"Array with status information for all PPBC.PowerSequenceContainers in the PPBC.PowerProfileDefinition.\"";
     PPBC_PROGRESS = "S2-PPBC-005", Error, false,
-        "Progress must be present exactly when a sequence has been selected and started",
-        "`S2J schemas/PPBC.PowerSequenceContainerStatus.progress`: \"A value must be provided, unless no sequence has been selected or the selected sequence hasn't started yet.\"";
+        "A status for a sequence that has started must report its progress",
+        "`S2J schemas/PPBC.PowerSequenceContainerStatus.progress`: \"A value must be provided, unless no sequence has been selected or the selected sequence hasn't started yet.\" This is the half the sentence states plainly: once the selected sequence is running, the CEM is told how far in it is.";
     PPBC_WINDOW_TOO_SHORT = "S2-PPBC-006", Warning, false,
         "The window is shorter than the shortest sequence offered",
         "Implied by the two together: a task that cannot finish inside its own window is one no CEM can schedule.";
+    PPBC_PROGRESS_UNEXPECTED = "S2-PPBC-007", Warning, false,
+        "Progress was reported for a sequence that has not started",
+        "The converse of `S2-PPBC-005`, and it is **not stated**. `S2J schemas/PPBC.PowerSequenceContainerStatus.progress` says a value \"must be provided, unless no sequence has been selected or the selected sequence hasn\u{2019}t started yet\" — which grants permission to omit it, and does not forbid sending it. A `progress` of zero beside a `SCHEDULED` status is redundant rather than wrong, and refusing it would make this crate stricter than the standard (D4). A warning, so a peer that means something by it is still heard.";
+    PPBC_SEQUENCE_NOT_NAMED = "S2-PPBC-008", Error, false,
+        "A status that says a sequence was selected must name which one",
+        "`S2J schemas/PPBC.PowerSequenceContainerStatus.selected_sequence_id`: \"When no ID is given, no sequence was selected yet.\" Read the other way round, which is the way a receiver reads it: a status whose `status` is anything but NOT_SCHEDULED asserts that a sequence *was* selected, and a CEM that is not told which one cannot match the progress to a duration.";
 
     // --- OMBC -------------------------------------------------------------
     OMBC_UNKNOWN_MODE = "S2-OMBC-001", Error, true,

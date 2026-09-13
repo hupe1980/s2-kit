@@ -1,6 +1,6 @@
 [package]
 name         = "s2-kit"
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.94"
 authors      = ["hupe1980"]
@@ -117,6 +117,9 @@ schemars = "1.2.2"
 criterion = { version = "0.8.0", features = ["html_reports"] }
 # `tests/properties.rs`.
 proptest = "1.11.0"
+# The official crate, linked so `tests/interop_s2energy.rs` can check the two models against
+# each other. A dev-dependency, not a container or a subprocess.
+s2energy = "0.3"
 
 # Integration tests declare what they need so `cargo test --no-default-features` skips what
 # cannot run instead of failing to compile it. `uuid` appears wherever a test uses a
@@ -153,6 +156,11 @@ required-features = ["connect-client", "connect-server"]
 name = "vendoring"
 required-features = ["std"]
 
+# Differential interoperability against the official crate.
+[[test]]
+name = "interop_s2energy"
+required-features = ["testing", "uuid"]
+
 # Every example drives two engines through the in-memory pipe, so every example needs
 # `testing`.
 [[example]]
@@ -174,6 +182,12 @@ required-features = ["testing"]
 [[example]]
 name = "connect_pair"
 required-features = ["connect-client", "connect-server"]
+
+# A bare-WebSocket CEM the *official* example Resource Managers can dial. Not a demo: it
+# is the peer half of the interoperability matrix (M6), and it exits non-zero on a refusal.
+[[example]]
+name = "interop_cem"
+required-features = ["connect-server", "tokio"]
 
 [[bin]]
 name = "s2-kit"

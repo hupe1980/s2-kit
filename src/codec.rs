@@ -313,7 +313,11 @@ pub fn decode_with(text: &str, options: &DecodeOptions) -> Result<Decoded, Decod
                 }
             })?;
             let mut pruned = Vec::new();
-            crate::schema::prune_unknown(&mut value, kind.as_str(), &mut pruned);
+            // Against the *negotiated* profile: the property table is v1.0.0's, and
+            // `DDBC.SystemDescription.present_demand_rate` is required in `0.0.2-beta`
+            // and absent from v1.0.0. Pruning against the wrong one removes a required
+            // field and then refuses the message for missing it.
+            crate::schema::prune_unknown(&mut value, kind.as_str(), options.profile, &mut pruned);
             let message =
                 serde_json::from_value::<Message>(value).map_err(|e| DecodeError::Schema {
                     kind,
@@ -549,6 +553,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, DecodeError::ProfileMismatch { .. }), "{e}");
+    }
+
+    #[test]
+    fn a_lenient_reader_on_the_beta_profile_still_reads_the_beta_shape() {
+        // The bug this pins: lenient pruning ran against the v1.0.0 property table, so
+        // it stripped `present_demand_rate` — which `0.0.2-beta` *requires* — and then
+        // `check_profile` refused the message for the field the pruner had just removed.
+        // An `Analyzer` on the beta profile could therefore not read a single conforming
+        // `DDBC.SystemDescription`, which is precisely the transcript it exists for.
+        let beta = r#"{"message_type":"DDBC.SystemDescription","message_id":"m1",
+            "valid_from":"2019-08-24T14:15:22Z","actuators":[],
+            "present_demand_rate":{"start_of_range":0.0,"end_of_range":1.0},
+            "provides_average_demand_rate_forecast":false,"vendor":"x"}"#;
+        let options = DecodeOptions::default()
+            .profile(WireProfile::V0_0_2Beta)
+            .lenient();
+        let decoded = decode_with(beta, &options).expect("a conforming beta message");
+        assert_eq!(decoded.pruned, alloc::vec!["/vendor".to_string()]);
+        let Message::DdbcSystemDescription(d) = decoded.message else {
+            panic!("wrong kind")
+        };
+        assert!(d.present_demand_rate.is_some());
     }
 
     #[test]

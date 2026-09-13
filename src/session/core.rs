@@ -68,6 +68,28 @@ pub enum SessionState {
 }
 
 impl SessionState {
+    /// Which row of `S2C §State of communication` this session is on.
+    ///
+    /// [`Idle`](Self::Idle) and [`Handshaking`](Self::Handshaking) are both
+    /// [`Phase::Negotiating`](crate::validate::Phase::Negotiating): a session that has not
+    /// opened and one that is mid-handshake have the same answer to "may this message
+    /// cross?", which is *no, the two sides have not agreed which schema to read it
+    /// against*.
+    ///
+    /// A [`Closed`](Self::Closed) session reports
+    /// [`Phase::Connected`](crate::validate::Phase::Connected) and nothing reads
+    /// it: every path that consults the table refuses on [`is_closed`](Self::is_closed)
+    /// first.
+    #[must_use]
+    pub fn phase(&self) -> crate::validate::Phase {
+        use crate::validate::Phase;
+        match self {
+            SessionState::Idle | SessionState::Handshaking => Phase::Negotiating,
+            SessionState::Connected | SessionState::Closed(_) => Phase::Connected,
+            SessionState::ControlTypeSelected(c) => Phase::selected(*c),
+        }
+    }
+
     /// The control type that is active, if it is one that can be instructed.
     #[must_use]
     pub fn active_control_type(&self) -> Option<ControlType> {
@@ -366,6 +388,15 @@ pub struct Registry {
     pub ppbc_profiles: Vec<ppbc::PowerProfileDefinition>,
     /// Instruction identifiers used.
     pub instructions: Vec<Id>,
+    /// `(message_id, instruction_id)` for every instruction seen on this session.
+    ///
+    /// Kept so that an `InstructionStatusUpdate` naming an identifier nobody instructed
+    /// can say *why*: the commonest cause by far is a peer echoing the instruction's
+    /// `message_id` instead of its `id`, and the two are both `ID`s and both present in
+    /// the message it is answering. The official `s2-example-implementations` battery
+    /// does exactly this, so anybody who talks to it meets the mistake on their first
+    /// instruction.
+    pub instruction_messages: Vec<(Id, Id)>,
     /// The latest status of each instruction.
     pub instruction_statuses: Vec<(Id, InstructionStatus)>,
     /// Objects that could be revoked.
@@ -420,11 +451,19 @@ impl Registry {
                 |(t, i)| (*t, *i),
             );
         }
-        if let Some(id) = message.instruction_id()
-            && !self.instructions.contains(&id)
-        {
-            self.instructions.push(id);
-            Self::bound(&mut self.instructions);
+        if let Some(id) = message.instruction_id() {
+            if !self.instructions.contains(&id) {
+                self.instructions.push(id);
+                Self::bound(&mut self.instructions);
+            }
+            if let Some(message_id) = message.id() {
+                Self::upsert(
+                    &mut self.instruction_messages,
+                    &message_id,
+                    (message_id, id),
+                    |(m, _)| *m,
+                );
+            }
         }
 
         let scheduled_for = match message {
@@ -688,7 +727,7 @@ impl Registry {
         &'a self,
         profile: WireProfile,
         sender: EnergyManagementRole,
-        active: Option<ControlType>,
+        phase: crate::validate::Phase,
         s2_connect: bool,
         now: Timestamp,
         seen: &'a [Id],
@@ -697,7 +736,7 @@ impl Registry {
         Context {
             profile,
             sender: Some(sender),
-            active_control_type: active,
+            phase,
             s2_connect,
             details: self.details.as_ref(),
             frbc: self.frbc.as_ref(),
@@ -706,6 +745,7 @@ impl Registry {
             pebc_constraints: &self.pebc_constraints,
             ppbc_profiles: &self.ppbc_profiles,
             instructions: &self.instructions,
+            instruction_messages: &self.instruction_messages,
             instruction_statuses: &self.instruction_statuses,
             seen_message_ids: seen,
             published: &self.published,
@@ -740,6 +780,13 @@ pub struct Stats {
     /// Inbound messages accepted with warnings — the ones worth looking at before they
     /// become refusals.
     pub accepted_with_warnings: u64,
+    /// Outbound messages this side sent that its own validator had something to say
+    /// about.
+    ///
+    /// Counted separately from the inbound ones because they mean the opposite thing: an
+    /// inbound warning is a peer to talk to, an outbound one is a bug on this side that
+    /// has not been refused yet.
+    pub sent_with_warnings: u64,
     /// Duplicate deliveries answered again rather than processed twice.
     pub duplicates: u64,
     /// Outbound messages the peer accepted.
@@ -809,7 +856,13 @@ pub struct SessionCore {
     pub max_message_bytes: usize,
     /// Whether to prune unknown properties instead of refusing the message.
     pub strictness: codec::Strictness,
-    /// How many reconnection attempts have failed, for the back-off.
+    /// How many reconnection attempts have already failed, for the back-off.
+    ///
+    /// A session object lives for exactly one connection, so this cannot be counted
+    /// *here*: it is what the application carries across reconnections, through
+    /// `RmConfig::after_failed_attempts` / `CemConfig::after_failed_attempts`. Left at
+    /// zero, every `Closed` event would recommend the same two-second ceiling for ever,
+    /// which is a back-off that does not back off.
     pub reconnect_attempt: u32,
     /// What this session has done.
     pub stats: Stats,
@@ -838,6 +891,7 @@ pub(crate) struct CoreConfig {
     pub max_message_bytes: usize,
     pub strictness: codec::Strictness,
     pub s2_connect: bool,
+    pub reconnect_attempt: u32,
 }
 
 impl SessionCore {
@@ -851,6 +905,7 @@ impl SessionCore {
             max_message_bytes,
             strictness,
             s2_connect,
+            reconnect_attempt,
         } = cfg;
         let profile = match &negotiation {
             Negotiation::PreNegotiated(p) => *p,
@@ -869,7 +924,7 @@ impl SessionCore {
             skew_tolerance,
             max_message_bytes,
             strictness,
-            reconnect_attempt: 0,
+            reconnect_attempt,
             stats: Stats::default(),
             role,
             minted: 0,
@@ -1066,6 +1121,7 @@ mod tests {
             max_message_bytes: 1024,
             strictness: codec::Strictness::Strict,
             s2_connect: false,
+            reconnect_attempt: 0,
         }
     }
 

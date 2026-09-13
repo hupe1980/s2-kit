@@ -3,6 +3,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -93,6 +94,14 @@ pub enum Error {
     /// The certificate presented changed between two requests of one pairing attempt.
     #[error("the server's certificate changed during the pairing attempt")]
     IdentityChanged,
+    /// The endpoint answered with more bytes than any S2 Connect body can legitimately be.
+    #[error("{operation} answered with more than {max} bytes")]
+    ResponseTooLarge {
+        /// Which operation.
+        operation: &'static str,
+        /// The cap that was exceeded.
+        max: usize,
+    },
 }
 
 impl Error {
@@ -113,6 +122,21 @@ impl Error {
         }
     }
 }
+
+/// The most of an endpoint's answer that will be read into memory.
+///
+/// The symmetric half of [`MAX_BODY_BYTES`](crate::connect::server::MAX_BODY_BYTES), and
+/// it matters for a reason that is easy to miss: during a LAN pairing the server is
+/// deliberately **not** authenticated — that is the whole meaning of
+/// [`TlsPolicy::LanPairingOnly`] — so the four pairing requests are answered by whatever
+/// is on the other end of the socket, which on a LAN is anything that got there first.
+/// Without a cap, a `reqwest` `text()` reads the lot.
+///
+/// Every S2 Connect body is a handful of identifiers, descriptions and Base64 challenges.
+/// `GET /v1/nodes` is the largest, and it is a list of node descriptions. A quarter of a
+/// mebibyte is four times what the server side accepts, so a long node list fits and a
+/// hostile endpoint still cannot make a constrained Resource Manager hold a gigabyte.
+pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// An HTTPS connection to one S2 Connect endpoint.
 #[derive(Debug, Clone)]
@@ -164,6 +188,32 @@ impl Http {
         body: &B,
     ) -> Result<R, Error> {
         let text = self.post_raw(operation, path, bearer, Some(body)).await?;
+        serde_json::from_str(&text).map_err(|source| Error::Body { operation, source })
+    }
+
+    /// `POST {base}{path}` with **no request body at all**, expecting one back.
+    ///
+    /// `confirmAccessToken` is the one operation `S2C-OAS session-init` defines with no
+    /// `requestBody`: the bearer *is* the message. Posting `null` with a JSON content type
+    /// — which is what serialising `()` produces — is a body the specification does not
+    /// define, and a peer entitled to validate against the OpenAPI is entitled to refuse
+    /// it.
+    pub(crate) async fn post_bodyless<R: DeserializeOwned>(
+        &self,
+        operation: &'static str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> Result<R, Error> {
+        let url = self.join(path)?;
+        let mut request = self.client.post(url);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|e| Error::Transport {
+            operation,
+            source: Box::new(e),
+        })?;
+        let text = self.read(operation, response).await?;
         serde_json::from_str(&text).map_err(|source| Error::Body { operation, source })
     }
 
@@ -226,7 +276,7 @@ impl Http {
         response: reqwest::Response,
     ) -> Result<String, Error> {
         let status = Status(response.status().as_u16());
-        let text = response.text().await.unwrap_or_default();
+        let text = read_bounded(operation, response).await?;
         if status.is_success() {
             return Ok(text);
         }
@@ -242,6 +292,47 @@ impl Http {
             .join(path.trim_start_matches('/'))
             .map_err(|_| Error::Url(alloc::format!("{}{path}", self.base)))
     }
+}
+
+/// Read a response body, refusing anything past [`MAX_RESPONSE_BYTES`].
+///
+/// Chunk by chunk rather than `Response::text()`, because `text()` has already allocated
+/// the whole body by the time it returns a value anyone could measure. `Content-Length` is
+/// checked first where the server sent one — it is a hint and not a promise, so the
+/// running total is what actually enforces the cap.
+async fn read_bounded(
+    operation: &'static str,
+    mut response: reqwest::Response,
+) -> Result<String, Error> {
+    let too_large = || Error::ResponseTooLarge {
+        operation,
+        max: MAX_RESPONSE_BYTES,
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|e| Error::Transport {
+            operation,
+            source: Box::new(e),
+        })?;
+        let Some(chunk) = chunk else { break };
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    // Not `from_utf8_lossy`: a body that is not UTF-8 is not an S2 Connect body, and
+    // replacing the bad bytes would hand the JSON parser a plausible-looking lie.
+    String::from_utf8(body).map_err(|e| Error::Transport {
+        operation,
+        source: Box::new(e),
+    })
 }
 
 /// Make a base URL joinable: HTTPS, and ending in a slash.

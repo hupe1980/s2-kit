@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! s2-kit validate message.json   # one message, or an array, or one per line
+//! s2-kit validate --beta m.json   # read it as S2 JSON v0.0.2-beta
 //! s2-kit replay session.s2log    # a whole conversation, cross-message rules and all
 //! s2-kit rules                   # the catalogue, as Markdown
 //! ```
@@ -60,6 +61,13 @@ enum Command {
         /// Treat warnings as failures.
         #[arg(long)]
         strict_warnings: bool,
+        /// Read the messages as S2 JSON v0.0.2-beta rather than v1.0.0.
+        ///
+        /// The two tags differ in one field, and reading a beta
+        /// `DDBC.SystemDescription` as v1.0.0 refuses it for carrying
+        /// `present_demand_rate` — which that tag requires.
+        #[arg(long)]
+        beta: bool,
     },
     /// Replay a `.s2log` transcript: cross-message rules, the answers, and the gaps.
     Replay {
@@ -120,17 +128,29 @@ fn run() -> Result<bool> {
             path,
             lenient,
             strict_warnings,
-        } => Ok(validate_text(&read(&path)?, lenient, strict_warnings)),
+            beta,
+        } => Ok(validate_text(
+            &read(&path)?,
+            lenient,
+            strict_warnings,
+            profile(beta),
+        )),
         Command::Replay { path, options } => Ok(replay_text(&read(&path)?, options)),
     }
 }
 
 /// Accepts a single message, a JSON array of them, or one message per line.
-fn validate_text(text: &str, lenient: bool, strict_warnings: bool) -> bool {
-    let mut options = DecodeOptions::default();
+fn validate_text(text: &str, lenient: bool, strict_warnings: bool, profile: WireProfile) -> bool {
+    let mut options = DecodeOptions::default().profile(profile);
     if lenient {
         options = options.lenient();
     }
+    // The profile is a *validation* input as well as a decoding one: `S2-MSG-008` checks
+    // the one field the two tags disagree about.
+    let ctx = Context {
+        profile,
+        ..Context::empty()
+    };
 
     let mut ok = true;
     let mut checked = 0usize;
@@ -146,7 +166,7 @@ fn validate_text(text: &str, lenient: bool, strict_warnings: bool) -> bool {
                 for path in &decoded.pruned {
                     println!("{label}: pruned {path}");
                 }
-                let report = decoded.message.validate(&Context::empty());
+                let report = decoded.message.validate(&ctx);
                 for violation in report.violations() {
                     println!("{label}: {violation}");
                     if violation.severity == Severity::Error || strict_warnings {
@@ -172,11 +192,7 @@ fn replay_text(text: &str, options: ReplayOptions) -> bool {
         return false;
     }
 
-    let mut analyzer = Analyzer::new().profile(if options.beta {
-        WireProfile::V0_0_2Beta
-    } else {
-        WireProfile::V1_0_0
-    });
+    let mut analyzer = Analyzer::new().profile(profile(options.beta));
     if options.strict {
         analyzer = analyzer.strict();
     }
@@ -200,6 +216,15 @@ fn replay_text(text: &str, options: ReplayOptions) -> bool {
         if failed { "FAILED" } else { "ok" }
     );
     !failed
+}
+
+/// Which set of schemas to read against.
+const fn profile(beta: bool) -> WireProfile {
+    if beta {
+        WireProfile::V0_0_2Beta
+    } else {
+        WireProfile::V1_0_0
+    }
 }
 
 /// Splits the input into messages: a JSON array's elements, one per line, or the whole

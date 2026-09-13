@@ -49,6 +49,14 @@ pub struct RmConfig {
     pub s2_connect: bool,
     /// Whether to validate outbound messages and refuse to send an invalid one.
     pub validate_outbound: bool,
+    /// How many reconnection attempts have already failed.
+    ///
+    /// A session is one connection, so it cannot count these itself. Carry the number
+    /// across: the `reconnect_after` on a `Closed` event is
+    /// [`Backoff::ceiling`](crate::session::Backoff::ceiling) for *this* attempt, and a
+    /// session that always starts at zero always recommends two seconds — a back-off that
+    /// does not back off.
+    pub reconnect_attempt: u32,
 }
 
 impl Default for RmConfig {
@@ -66,6 +74,7 @@ impl Default for RmConfig {
             strictness: Strictness::Strict,
             s2_connect: false,
             validate_outbound: true,
+            reconnect_attempt: 0,
         }
     }
 }
@@ -108,6 +117,17 @@ impl RmConfig {
     #[must_use]
     pub fn ack_timeout(mut self, timeout: Duration) -> Self {
         self.ack_timeout = timeout;
+        self
+    }
+
+    /// Start this session knowing that `attempts` reconnections have already failed.
+    ///
+    /// What makes the `reconnect_after` on a `Closed` event grow. The application owns
+    /// the reconnection loop (D36), so it also owns the counter: reset it to zero after a
+    /// session that reached `Connected`, and increment it after one that did not.
+    #[must_use]
+    pub const fn after_failed_attempts(mut self, attempts: u32) -> Self {
+        self.reconnect_attempt = attempts;
         self
     }
 }
@@ -208,6 +228,20 @@ pub enum RmEvent {
         /// What is suspect about it.
         report: Report,
     },
+    /// A message **this side** sent had warnings of its own.
+    ///
+    /// `validate_outbound` refuses an outbound message with an *error* at the call site;
+    /// this is what it has to say about the rest. A resource publishing a description
+    /// `s2-python` will refuse (`S2-ACT-001`), or a manager instructing a transition its
+    /// own picture of the timers says is blocked (`S2-INST-005`), learns it here rather
+    /// than from a peer. Separate from [`Warnings`](Self::Warnings) because the two mean
+    /// opposite things: one is a peer worth watching, the other is this side.
+    OutboundWarnings {
+        /// What was sent.
+        kind: MessageKind,
+        /// What this side's own validator said about it.
+        report: Report,
+    },
     /// The session ended.
     Closed {
         /// Why.
@@ -277,6 +311,7 @@ impl RmSession {
             max_message_bytes: config.max_message_bytes,
             strictness: config.strictness,
             s2_connect: config.s2_connect,
+            reconnect_attempt: config.reconnect_attempt,
         });
         Self {
             core,
@@ -498,7 +533,7 @@ impl RmSession {
             let ctx = self.core.registry.context(
                 self.core.profile,
                 EnergyManagementRole::Cem,
-                self.core.state.active_control_type(),
+                self.core.state.phase(),
                 self.core.s2_connect,
                 now,
                 &seen,
@@ -650,7 +685,7 @@ impl RmSession {
                 let ctx = self.core.registry.context(
                     self.core.profile,
                     EnergyManagementRole::Cem,
-                    self.core.state.active_control_type(),
+                    self.core.state.phase(),
                     self.core.s2_connect,
                     now,
                     &seen,
@@ -753,11 +788,8 @@ impl RmSession {
                 profile: self.core.profile,
             });
         }
-        let allowance = crate::validate::allowed(
-            self.core.state.active_control_type(),
-            EnergyManagementRole::Rm,
-            kind,
-        );
+        let allowance =
+            crate::validate::allowed(self.core.state.phase(), EnergyManagementRole::Rm, kind);
         if !allowance.is_allowed() {
             return Err(SendError::NotAllowed {
                 kind,
@@ -770,7 +802,7 @@ impl RmSession {
                 let ctx = self.core.registry.context(
                     self.core.profile,
                     EnergyManagementRole::Rm,
-                    self.core.state.active_control_type(),
+                    self.core.state.phase(),
                     self.core.s2_connect,
                     now,
                     &seen,
@@ -780,6 +812,12 @@ impl RmSession {
             };
             if let Some(violation) = report.first_error() {
                 return Err(SendError::Invalid(Box::new(violation.clone())));
+            }
+            if !report.is_empty() {
+                self.core.stats.sent_with_warnings =
+                    self.core.stats.sent_with_warnings.saturating_add(1);
+                self.events
+                    .push_back(RmEvent::OutboundWarnings { kind, report });
             }
         }
         self.core.transmit(message, now).ok_or(SendError::Closed)
@@ -845,11 +883,7 @@ impl RmSession {
             // instruction to come straight back, whoever sent it.
             CloseReason::PeerRequested(SessionRequestType::Reconnect)
             | CloseReason::LocallyRequested(SessionRequestType::Reconnect) => Some(Duration::ZERO),
-            _ => {
-                let delay = self.backoff.ceiling(self.core.reconnect_attempt);
-                self.core.reconnect_attempt = self.core.reconnect_attempt.saturating_add(1);
-                Some(delay)
-            }
+            _ => Some(self.backoff.ceiling(self.core.reconnect_attempt)),
         };
         self.core.state = SessionState::Closed(reason.clone());
         self.events.push_back(RmEvent::Closed {

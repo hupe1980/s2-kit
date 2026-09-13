@@ -166,32 +166,43 @@ impl Discovery {
             .map(|(k, v)| (k.to_string(), v))
             .collect();
 
-        // One registration per role, because DNS-SD subtypes are advertised that way: an
-        // endpoint hosting both a CEM and an RM is discoverable under both.
+        // `S2C §DNS-SD based discovery`: "`_cem` and `_rm` are both used when the endpoint
+        // contains both CEM and RM nodes". `mdns-sd` cannot express that — a `ServiceInfo`
+        // holds one `Option<String>` of subtype, and the daemon keys registrations by
+        // *fullname*, which carries no subtype, so two registrations of one instance
+        // collide rather than adding a second subtype.
+        //
+        // A dual-role endpoint is therefore advertised on the **plain** service type: it
+        // stays discoverable by an unfiltered browse, its TXT record is unchanged, and
+        // `Discovered::hosts` answers `None` for "the subtype was not visible, ask
+        // `GET /v1/nodes`". Losing the filter beats losing half the audience (D44).
         let subtypes = record.subtypes();
-        let types: Vec<String> = if subtypes.is_empty() {
-            alloc::vec![SERVICE_FQDN.to_string()]
-        } else {
-            subtypes
-                .iter()
-                .map(|sub| alloc::format!("{sub}._sub.{SERVICE_FQDN}"))
-                .collect()
+        let ty = match subtypes.as_slice() {
+            [] => SERVICE_FQDN.to_string(),
+            [only] => alloc::format!("{only}._sub.{SERVICE_FQDN}"),
+            _ => {
+                crate::trace::event!(
+                    warn,
+                    instance = instance,
+                    "an endpoint hosting both roles is advertised on the plain service \
+                     type: mdns-sd cannot put one instance under two DNS-SD subtypes"
+                );
+                SERVICE_FQDN.to_string()
+            }
         };
 
-        for ty in types {
-            let info = mdns_sd::ServiceInfo::new(
-                &ty,
-                instance,
-                &alloc::format!("{}.", host.trim_end_matches('.')),
-                "",
-                port,
-                properties.clone(),
-            )?
-            // Let the daemon fill in this machine's addresses; hard-coding them is how a
-            // device ends up advertising an address it lost at the last DHCP lease.
-            .enable_addr_auto();
-            self.daemon.register(info)?;
-        }
+        let info = mdns_sd::ServiceInfo::new(
+            &ty,
+            instance,
+            &alloc::format!("{}.", host.trim_end_matches('.')),
+            "",
+            port,
+            properties,
+        )?
+        // Let the daemon fill in this machine's addresses; hard-coding them is how a
+        // device ends up advertising an address it lost at the last DHCP lease.
+        .enable_addr_auto();
+        self.daemon.register(info)?;
         Ok(())
     }
 
@@ -314,6 +325,43 @@ fn resolve(event: mdns_sd::ServiceEvent) -> Option<Discovered> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_subtypes_cannot_share_one_instance_and_that_is_why_we_do_not_try() {
+        // `S2C §DNS-SD based discovery` requires a dual-role endpoint to advertise both
+        // `_cem` and `_rm`. `mdns-sd` cannot: its registrations are keyed by *fullname*,
+        // and a fullname is `<instance>.<service>.<domain>` with no subtype in it. So
+        // registering one instance twice does not advertise two subtypes — the second
+        // silently replaces the first, and the endpoint is discoverable under whichever
+        // role came last.
+        //
+        // This is asserted against the library rather than remembered in a comment,
+        // because the day `mdns-sd` grows multi-subtype support is the day this test
+        // fails and the workaround in `advertise` can go.
+        let of = |sub: &str| {
+            mdns_sd::ServiceInfo::new(
+                &alloc::format!("{sub}._sub.{SERVICE_FQDN}"),
+                "EVSE1038",
+                "EVSE1038.local.",
+                "127.0.0.1",
+                443,
+                None,
+            )
+            .expect("a legal service info")
+        };
+        let cem = of("_cem");
+        let rm = of("_rm");
+        assert_ne!(
+            cem.get_subtype(),
+            rm.get_subtype(),
+            "two different subtypes"
+        );
+        assert_eq!(
+            cem.get_fullname(),
+            rm.get_fullname(),
+            "…that collide on the key the daemon stores them under"
+        );
+    }
 
     fn record() -> ServiceRecord {
         ServiceRecord {

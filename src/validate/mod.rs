@@ -63,7 +63,7 @@ use crate::types::common::{
 use crate::types::{Duration, Id, Timestamp, WireProfile, ddbc, frbc, ombc, pebc, ppbc};
 
 pub use rules::Rule;
-pub use state::{Allowance, allowed};
+pub use state::{Allowance, Phase, allowed};
 
 /// A stable rule identifier, such as `S2-FRBC-004`.
 ///
@@ -291,8 +291,10 @@ pub struct Context<'a> {
     pub profile: WireProfile,
     /// Which role sent the message being validated.
     pub sender: Option<EnergyManagementRole>,
-    /// The control type that is active, if any.
-    pub active_control_type: Option<ControlType>,
+    /// Where the session has got to: negotiating, connected, or a control type active.
+    ///
+    /// The row of `S2C §State of communication` this message is being judged against.
+    pub phase: Phase,
     /// Whether the session is running under S2 Connect, where the handshake messages
     /// must not appear.
     pub s2_connect: bool,
@@ -310,6 +312,9 @@ pub struct Context<'a> {
     pub ppbc_profiles: &'a [ppbc::PowerProfileDefinition],
     /// Instruction identifiers the CEM has already used.
     pub instructions: &'a [Id],
+    /// `(message_id, instruction_id)` for each of them, so that a status update naming
+    /// the wrong one of the two can say which mistake was made.
+    pub instruction_messages: &'a [(Id, Id)],
     /// The latest status of each instruction.
     pub instruction_statuses: &'a [(Id, InstructionStatus)],
     /// Message identifiers already seen this session.
@@ -363,14 +368,27 @@ impl<'a> Context<'a> {
     /// With a control type active, which the state rules need.
     #[must_use]
     pub fn active(mut self, control_type: ControlType) -> Self {
-        self.active_control_type = Some(control_type);
+        self.phase = Phase::selected(control_type);
         self
+    }
+
+    /// With the session in a particular phase, which the state rules need.
+    #[must_use]
+    pub const fn in_phase(mut self, phase: Phase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// The control type that is active, if one that can be instructed is.
+    #[must_use]
+    pub const fn active_control_type(&self) -> Option<ControlType> {
+        self.phase.active_control_type()
     }
 
     /// Whether cross-message rules can run at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sender.is_none() && self.details.is_none() && self.active_control_type.is_none()
+        self.sender.is_none() && self.details.is_none() && self.phase == Phase::Connected
     }
 
     fn timer_finished_at(&self, actuator: &Id, timer: &Id) -> Option<Timestamp> {
@@ -564,7 +582,7 @@ where
             out.push(
                 rules::ONE_VALUE_PER_QUANTITY,
                 path,
-                format!("{q:?} appears more than once"),
+                format!("{} appears more than once", q.as_str()),
             );
         } else {
             seen.push(q);
@@ -687,7 +705,8 @@ pub(crate) fn check_observed(at: Timestamp, path: &str, ctx: &Context<'_>, out: 
             rules::TIMESTAMP_SKEW,
             path,
             format!(
-                "{at} says something has already happened, but it is {} ms ahead of the                  local clock ({now}), which tolerates {} ms of skew",
+                "{at} says something has already happened, but it is {} ms ahead of \
+                 the local clock ({now}), which tolerates {} ms of skew",
                 ahead.as_millis(),
                 ctx.skew_tolerance.as_millis()
             ),
@@ -851,15 +870,14 @@ pub(crate) fn check_envelope(
     out: &mut Report,
 ) {
     if let Some(sender) = ctx.sender {
-        match state::allowed(ctx.active_control_type, sender, kind) {
+        match state::allowed(ctx.phase, sender, kind) {
             Allowance::Yes => {}
             Allowance::WrongState => out.push(
                 rules::NOT_ALLOWED_IN_STATE,
                 "",
                 format!(
-                    "{kind} is not allowed while the active control type is {}",
-                    ctx.active_control_type
-                        .map_or("none", |c| c.abbreviation().unwrap_or("none"))
+                    "{kind} is not allowed while the session is {}",
+                    ctx.phase.label()
                 ),
             ),
             Allowance::WrongRole => out.push(

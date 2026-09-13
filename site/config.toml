@@ -1,7 +1,7 @@
 # Zola configuration. `zola serve` to preview, `zola build` to render into `public/`.
 base_url = "https://hupe1980.github.io/s2-kit"
 title = "s2-kit"
-description = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: a proven data model, a 61-rule semantic validator, sans-I/O session engines for both roles, and S2 Connect end to end."
+description = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: a proven data model, a 65-rule semantic validator, sans-I/O session engines for both roles, and S2 Connect end to end."
 author = "Frank Hübner"
 
 compile_sass = true

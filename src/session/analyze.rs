@@ -39,7 +39,7 @@ use crate::codec::{self, DecodeError, DecodeOptions, Strictness};
 use crate::message::{Message, MessageKind};
 use crate::types::common::{ControlType, EnergyManagementRole, ReceptionStatusValues};
 use crate::types::{Duration, Id, Timestamp, WireProfile};
-use crate::validate::{Report, Validate, rules};
+use crate::validate::{Phase, Report, Validate, rules};
 
 /// What an [`Analyzer`] made of one frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +103,7 @@ pub struct Analyzer {
     registry: Registry,
     profile: WireProfile,
     strictness: Strictness,
-    active: Option<ControlType>,
+    phase: Phase,
     seen: Vec<Id>,
     skew_tolerance: Duration,
     s2_connect: bool,
@@ -124,7 +124,11 @@ impl Analyzer {
             registry: Registry::default(),
             profile: WireProfile::V1_0_0,
             strictness: Strictness::Lenient,
-            active: None,
+            // `Connected`, not `Negotiating`: a transcript may start anywhere, and an
+            // observer that assumed it had seen the beginning would invent a refusal for
+            // every message in a capture that starts mid-session. A `Handshake` is legal
+            // in this row too, so nothing real is lost.
+            phase: Phase::Connected,
             seen: Vec::new(),
             skew_tolerance: Duration::from_secs(30),
             s2_connect: false,
@@ -172,7 +176,13 @@ impl Analyzer {
     /// The control type in force, as the conversation has selected it.
     #[must_use]
     pub const fn active_control_type(&self) -> Option<ControlType> {
-        self.active
+        self.phase.active_control_type()
+    }
+
+    /// Which row of the state table the conversation is on.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
     }
 
     /// Observe one frame.
@@ -211,7 +221,7 @@ impl Analyzer {
                     let ctx = self.registry.context(
                         self.profile,
                         sender,
-                        self.active,
+                        self.phase,
                         self.s2_connect,
                         now,
                         &self.seen,
@@ -257,8 +267,7 @@ impl Analyzer {
             // wait for the acknowledgement the way a `CemSession` does: it may not have
             // been recorded, and a transcript that starts mid-session never carries it.
             Message::SelectControlType(select) => {
-                self.active = (select.control_type != ControlType::NoSelection)
-                    .then_some(select.control_type);
+                self.phase = Phase::selected(select.control_type);
             }
             Message::RevokeObject(revoke) => {
                 self.registry.revoke(revoke.object_type, revoke.object_id);

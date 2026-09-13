@@ -123,6 +123,6 @@ that *decides* anything is in the session.
 
 ## Where next
 
-- [Validation](@/docs/validation.md) — what the 61 rules check, and why some are warnings.
+- [Validation](@/docs/validation.md) — what the 65 rules check, and why some are warnings.
 - [Sessions](@/docs/sessions.md) — acknowledgements, instructions and fleets.
 - [S2 Connect](@/docs/connect.md) — discovery, pairing and session initiation.

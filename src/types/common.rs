@@ -37,6 +37,8 @@ pub enum Commodity {
 /// A commodity combined with the quantity and unit its power is expressed in, and — for
 /// electricity — the phase.
 ///
+/// The unit is **not** always watts: [`unit`](Self::unit) is what a diagnostic should use.
+///
 /// Note that `HEAT.TEMPERATURE` is in this list although a temperature is not a power.
 /// The standard puts it here; the model follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -105,6 +107,52 @@ impl CommodityQuantity {
     #[must_use]
     pub const fn is_power(self) -> bool {
         !matches!(self, Self::HeatTemperature)
+    }
+
+    /// The unit a value of this quantity is expressed in.
+    ///
+    /// Four of the ten are not watts (`S2J schemas/CommodityQuantity`: litres per second,
+    /// grams per second, degrees Celsius, litres per hour), so any log line, diagnostic or
+    /// user interface that appends `"W"` to a `PowerValue` is wrong four times out of ten
+    /// — including for the one quantity that is not a power at all.
+    ///
+    /// ```
+    /// use s2_kit::types::common::CommodityQuantity;
+    ///
+    /// assert_eq!(CommodityQuantity::ElectricPowerL1.unit(), "W");
+    /// assert_eq!(CommodityQuantity::HeatTemperature.unit(), "°C");
+    /// assert_eq!(CommodityQuantity::OilFlowRate.unit(), "l/h");
+    /// ```
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::ElectricPowerL1
+            | Self::ElectricPowerL2
+            | Self::ElectricPowerL3
+            | Self::ElectricPower3PhaseSymmetric
+            | Self::HeatThermalPower => "W",
+            Self::NaturalGasFlowRate | Self::HeatFlowRate => "l/s",
+            Self::HydrogenFlowRate => "g/s",
+            Self::HeatTemperature => "°C",
+            Self::OilFlowRate => "l/h",
+        }
+    }
+
+    /// The wire spelling, for a diagnostic that should say what the peer said.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ElectricPowerL1 => "ELECTRIC.POWER.L1",
+            Self::ElectricPowerL2 => "ELECTRIC.POWER.L2",
+            Self::ElectricPowerL3 => "ELECTRIC.POWER.L3",
+            Self::ElectricPower3PhaseSymmetric => "ELECTRIC.POWER.3_PHASE_SYMMETRIC",
+            Self::NaturalGasFlowRate => "NATURAL_GAS.FLOW_RATE",
+            Self::HydrogenFlowRate => "HYDROGEN.FLOW_RATE",
+            Self::HeatTemperature => "HEAT.TEMPERATURE",
+            Self::HeatFlowRate => "HEAT.FLOW_RATE",
+            Self::HeatThermalPower => "HEAT.THERMAL_POWER",
+            Self::OilFlowRate => "OIL.FLOW_RATE",
+        }
     }
 }
 

@@ -186,6 +186,31 @@ jobs:
             exit 1
           fi
 
+  # Interoperability: this crate's CEM against Resource Managers nobody here wrote.
+  #
+  # Every other job in this file has s2-kit on both ends, which proves self-consistency and
+  # nothing about interoperating. This one builds the FlexiblePower **example
+  # implementations** from source and runs a real conversation over a real socket against
+  # each. The expected outcome of every row is recorded in `xtask`, so the job goes red for
+  # exactly two things: this crate regressing, and a peer being fixed upstream.
+  #
+  # No container runtime: the peers are Rust and their own Dockerfiles are
+  # `FROM rust:… RUN cargo build`, so `cargo` does the same work without a daemon that
+  # GitHub's macOS and Windows runners do not have.
+  interop:
+    name: interop against the official example implementations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone the example implementations
+        run: |
+          git clone --quiet --depth 1 \
+            https://github.com/flexiblepower/s2-example-implementations \
+            specs/_reference/s2-example-implementations
+      - run: cargo xtask interop
+
   # Every example in the README and in the documentation must actually run; an example
   # that only compiles is an example that has already drifted.
   examples:
@@ -203,6 +228,9 @@ jobs:
       # S2 Connect: pairing over real TLS, session initiation, and an authorised
       # WebSocket carrying a session between two engines.
       - run: cargo run --example connect_pair --all-features
+      # `interop_cem` is deliberately absent: it is a *server* that waits for a peer to
+      # dial it, and the `interop` job above is what supplies one.
+      - run: cargo build --example interop_cem --features connect-server,tokio
 
   # The website must build, and its internal links must resolve. `zola check` also walks
   # external links, which makes it a slow and flaky gate — so the build is the gate and

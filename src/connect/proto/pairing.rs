@@ -345,6 +345,15 @@ pub struct PairingClient {
     protocols: Vec<CommunicationProtocol>,
     force: bool,
     accepted: Option<PairingAccepted>,
+    /// The server's handle on the attempt, remembered **before** anything about the
+    /// server's answer is judged.
+    ///
+    /// It is not ours: it names a slot the server is holding open for us, and the server's
+    /// rate limit is one attempt per node per second, so an attempt left in flight refuses
+    /// every retry with `503` for the whole fifteen-second budget. A client that decides
+    /// the server failed its challenge still has to give the slot back, and cannot if it
+    /// only kept the id on the success path.
+    attempt_id: Option<PairingAttemptId>,
     details: Option<ConnectionDetails>,
     communication_server: Option<Role>,
 }
@@ -374,6 +383,7 @@ impl PairingClient {
             protocols: alloc::vec![CommunicationProtocol::WebSocket],
             force: false,
             accepted: None,
+            attempt_id: None,
             details: None,
             communication_server: None,
         }
@@ -406,7 +416,7 @@ impl PairingClient {
     /// The bearer for steps 6 through 8, once the server has issued one.
     #[must_use]
     pub fn attempt_id(&self) -> Option<&PairingAttemptId> {
-        self.accepted.as_ref().map(|a| &a.pairing_attempt_id)
+        self.attempt_id.as_ref()
     }
 
     /// Step 1: build `requestPairing` from 32 bytes of cryptographically secure
@@ -459,6 +469,9 @@ impl PairingClient {
         now: Timestamp,
     ) -> Result<NextStep, ConnectError> {
         self.expect(PairingStep::AwaitingAcceptance)?;
+        // Before anything can refuse: whatever the verdict below, the server is holding an
+        // attempt for us and this is the only way to hand it back.
+        self.attempt_id = Some(accepted.pairing_attempt_id.clone());
         self.within_budget(now)?;
         self.binding = Some(binding);
 

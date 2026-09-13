@@ -138,6 +138,10 @@ a:hover { text-decoration-thickness: 2px; }
 .prose {
   max-width: 68rem; margin: 0 auto; padding: 2.5rem 1.25rem;
 
+  // On the landing page the hero has already paid for the space above the first heading,
+  // and that heading brings 2.5rem of its own margin: three stacked gaps is a scroll.
+  .hero + & { padding-top: 0; }
+
   > h1 { font-size: clamp(1.8rem, 4vw, 2.5rem); line-height: 1.15; margin: 0 0 .75rem; }
   h2 { font-size: 1.45rem; margin: 2.5rem 0 .75rem; letter-spacing: -.01em; }
   h3 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
@@ -235,6 +239,15 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface) 45%, tr
   }
   h3 { margin-top: 0; }
   p { max-width: none; }
+}
+
+// Every page's content belongs inside `.hero` or `.prose`, both of which carry the gutter
+// and the measure. This is the net: a direct child of `main` that is neither still gets a
+// gutter rather than running edge to edge.
+main > :not(.hero):not(.prose) {
+  max-width: 68rem;
+  margin-inline: auto;
+  padding-inline: 1.25rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

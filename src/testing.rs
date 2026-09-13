@@ -28,14 +28,20 @@ use crate::session::{
     Analyzer, CemConfig, CemEvent, CemSession, Instructed, RmConfig, RmEvent, RmSession,
 };
 use crate::types::common::{
-    Commodity, CommodityQuantity, ControlType, NumberRange, PowerRange, ReceptionStatusValues,
-    ResourceManagerDetails, Role, RoleType, Timer, Transition,
+    Commodity, CommodityQuantity, ControlType, Currency, EnergyManagementRole, Handshake,
+    HandshakeResponse, InstructionStatus, InstructionStatusUpdate, NumberRange, PowerForecast,
+    PowerForecastElement, PowerForecastValue, PowerMeasurement, PowerRange, PowerValue,
+    ReceptionStatus, ReceptionStatusValues, ResourceManagerDetails, RevokableObjects, RevokeObject,
+    Role, RoleType, SelectControlType, SessionRequest, SessionRequestType, Timer, Transition,
 };
-use crate::types::{Duration, Id, Timestamp, frbc, pebc};
+use crate::types::{Duration, Id, ProtocolVersion, Timestamp, ddbc, frbc, ombc, pebc, ppbc};
 use crate::validate::Severity;
 
 /// Which way a message went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered so that a transcript index can be sorted and binary-searched by
+/// `(direction, message_id)`; the order itself means nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Direction {
     /// From the Customer Energy Manager to the Resource Manager.
     CemToRm,
@@ -44,6 +50,18 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// The other way.
+    ///
+    /// An acknowledgement always travels against the message it answers, which is the
+    /// one thing every lookup in [`replay`] needs.
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Direction::CemToRm => Direction::RmToCem,
+            Direction::RmToCem => Direction::CemToRm,
+        }
+    }
+
     /// The short form used in a transcript file.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -730,16 +748,29 @@ pub fn replay_with(entries: &[TranscriptEntry], mut analyzer: Analyzer) -> Repla
         ..ReplayReport::default()
     };
 
-    // What each side actually answered, by the identifier it named. Built first, because
-    // an answer may legitimately arrive several lines after the message it is about.
+    // Two indexes, both built in one pass, because the alternative is quadratic and this
+    // is the tool a field capture is fed to. A transcript of a hundred thousand lines is
+    // an ordinary thing to be handed after a week of trouble.
+    //
+    // * what each side answered, by the identifier it named — an answer may legitimately
+    //   arrive several lines after the message it is about;
+    // * which identifiers were actually *sent*, and in which direction, so that an answer
+    //   naming a message nobody sent can be spotted without re-peeking every other line.
     let mut answers: Vec<(Direction, Id, ReceptionStatusValues)> = Vec::new();
+    let mut sent: Vec<(Direction, Id)> = Vec::new();
     for entry in entries {
-        if entry.kind == MessageKind::ReceptionStatus
-            && let Ok(Message::ReceptionStatus(status)) = crate::codec::decode(&entry.text)
-        {
-            answers.push((entry.direction, status.subject_message_id, status.status));
+        if entry.kind == MessageKind::ReceptionStatus {
+            if let Ok(Message::ReceptionStatus(status)) = crate::codec::decode(&entry.text) {
+                answers.push((entry.direction, status.subject_message_id, status.status));
+            }
+            continue;
+        }
+        if let Ok(Some(id)) = crate::codec::peek(&entry.text).map(|p| p.message_id) {
+            sent.push((entry.direction, id));
         }
     }
+    answers.sort_unstable_by_key(|(direction, subject, _)| (*direction, *subject));
+    sent.sort_unstable();
 
     for (index, entry) in entries.iter().enumerate() {
         let line = index + 1;
@@ -763,14 +794,10 @@ pub fn replay_with(entries: &[TranscriptEntry], mut analyzer: Analyzer) -> Repla
             // recording is incomplete, or the peer answered something nobody sent. The
             // nil identifier is the one exception — it is what the ecosystem sends when
             // the message had no readable id at all (erratum E10).
-            let sent = entries.iter().any(|other| {
-                other.direction != entry.direction
-                    && crate::codec::peek(&other.text)
-                        .ok()
-                        .and_then(|p| p.message_id)
-                        == Some(status.subject_message_id)
-            });
-            if !sent && status.subject_message_id != Id::NIL {
+            let was_sent = sent
+                .binary_search(&(entry.direction.other(), status.subject_message_id))
+                .is_ok();
+            if !was_sent && status.subject_message_id != Id::NIL {
                 report.findings.push(Finding::UnmatchedAnswer {
                     line,
                     direction: entry.direction,
@@ -785,8 +812,9 @@ pub fn replay_with(entries: &[TranscriptEntry], mut analyzer: Analyzer) -> Repla
         };
         // The answer must come back the other way.
         let recorded = answers
-            .iter()
-            .find(|(direction, subject, _)| *direction != entry.direction && *subject == message_id)
+            .binary_search_by_key(&(entry.direction.other(), message_id), |(d, s, _)| (*d, *s))
+            .ok()
+            .and_then(|i| answers.get(i))
             .map(|(_, _, status)| *status);
 
         match recorded {
@@ -821,4 +849,492 @@ pub fn replay_with(entries: &[TranscriptEntry], mut analyzer: Analyzer) -> Repla
 
     report.findings.sort_by_key(Finding::line);
     report
+}
+
+// ---------------------------------------------------------------------------
+// One of everything, with every optional field populated
+// ---------------------------------------------------------------------------
+
+fn id(s: &str) -> Id {
+    Id::parse(s).unwrap_or(Id::NIL)
+}
+
+fn at() -> Timestamp {
+    Timestamp::from_unix(1_724_508_922, 0)
+}
+
+fn q() -> CommodityQuantity {
+    CommodityQuantity::ElectricPowerL1
+}
+
+fn number_range() -> NumberRange {
+    NumberRange::new(0.0, 100.0)
+}
+
+fn power_range() -> PowerRange {
+    PowerRange::new(0.0, 2000.0, q())
+}
+
+fn forecast_value() -> PowerForecastValue {
+    PowerForecastValue {
+        value_upper_limit: Some(1000.0),
+        value_upper_95ppr: Some(960.0),
+        value_upper_68ppr: Some(800.0),
+        value_expected: 545.1,
+        value_lower_68ppr: Some(340.0),
+        value_lower_95ppr: Some(100.0),
+        value_lower_limit: Some(0.0),
+        commodity_quantity: q(),
+    }
+}
+
+fn timer() -> Timer {
+    Timer {
+        id: id("timer0"),
+        diagnostic_label: Some("Minimum run time".into()),
+        duration: Duration::from_secs(7200),
+    }
+}
+
+fn transition(from: &str, to: &str) -> Transition {
+    Transition {
+        id: id("trans0"),
+        from: id(from),
+        to: id(to),
+        start_timers: vec![id("timer0")],
+        blocking_timers: vec![id("timer0")],
+        transition_costs: Some(0.0),
+        transition_duration: Some(Duration::from_secs(3)),
+        abnormal_condition_only: false,
+    }
+}
+
+fn frbc_actuator() -> frbc::ActuatorDescription {
+    frbc::ActuatorDescription {
+        id: id("actuator1"),
+        diagnostic_label: Some("heat pump".into()),
+        supported_commodities: vec![Commodity::Electricity],
+        operation_modes: vec![
+            frbc::OperationMode {
+                id: id("om0"),
+                diagnostic_label: Some("running".into()),
+                elements: vec![frbc::OperationModeElement {
+                    fill_level_range: number_range(),
+                    fill_rate: NumberRange::new(0.002_09, 0.008_35),
+                    power_ranges: vec![power_range()],
+                    running_costs: Some(NumberRange::new(0.0, 0.0)),
+                }],
+                abnormal_condition_only: false,
+            },
+            frbc::OperationMode {
+                id: id("om1"),
+                diagnostic_label: Some("Off".into()),
+                elements: vec![frbc::OperationModeElement {
+                    fill_level_range: number_range(),
+                    fill_rate: NumberRange::exactly(0.0),
+                    power_ranges: vec![PowerRange::exactly(0.0, q())],
+                    running_costs: None,
+                }],
+                abnormal_condition_only: false,
+            },
+        ],
+        transitions: vec![transition("om0", "om1")],
+        timers: vec![timer()],
+    }
+}
+
+fn ddbc_actuator() -> ddbc::ActuatorDescription {
+    ddbc::ActuatorDescription {
+        id: id("actuator1"),
+        diagnostic_label: Some("hybrid heat pump".into()),
+        supported_commodities: vec![Commodity::Electricity, Commodity::Gas],
+        operation_modes: vec![ddbc::OperationMode {
+            id: id("om0"),
+            diagnostic_label: Some("electric".into()),
+            power_ranges: vec![power_range()],
+            supply_range: NumberRange::new(0.0, 6000.0),
+            running_costs: Some(NumberRange::new(0.0, 0.0)),
+            abnormal_condition_only: false,
+        }],
+        transitions: vec![transition("om0", "om0")],
+        timers: vec![timer()],
+    }
+}
+
+/// One of every message, with **every optional field set**.
+///
+/// The corpus three different checks are run over, and the reason it lives here rather
+/// than in one of them: it is the answer to "show me every message this crate can
+/// produce", which is a thing a consumer writing its own tests wants as much as this
+/// crate does.
+///
+/// * `tests/model_matches_schema.rs` validates each one against the official JSON schema
+///   and requires every component the schema defines to be reachable from one of them;
+/// * `tests/interop_s2energy.rs` requires an independent implementation to read them;
+/// * a consumer can use it to exercise its own handler over the whole message space.
+///
+/// Identifiers are short and readable (`actuator1`, `om0`) rather than UUIDs, exactly as
+/// the standard's own worked examples write them — `S2J schemas/ID` is a pattern, not a
+/// UUID (erratum E1).
+#[must_use]
+pub fn every_message() -> Vec<Message> {
+    let versions = vec![ProtocolVersion::new("1.0.0")];
+    vec![
+        Handshake {
+            message_id: id("m1"),
+            role: EnergyManagementRole::Rm,
+            supported_protocol_versions: Some(versions),
+        }
+        .into(),
+        HandshakeResponse {
+            message_id: id("m1"),
+            selected_protocol_version: ProtocolVersion::new("1.0.0"),
+        }
+        .into(),
+        ResourceManagerDetails {
+            message_id: id("m1"),
+            resource_id: id("acme_heat_pump"),
+            name: Some("my_heat_pump".into()),
+            roles: vec![Role::new(RoleType::EnergyConsumer, Commodity::Electricity)],
+            manufacturer: Some("ACME".into()),
+            model: Some("HeatPump2000".into()),
+            serial_number: Some("123".into()),
+            firmware_version: Some("v1.0".into()),
+            instruction_processing_delay: Duration::from_millis(10_000),
+            available_control_types: vec![ControlType::FillRateBasedControl],
+            currency: Some(Currency::Eur),
+            provides_forecast: true,
+            provides_power_measurement_types: vec![q()],
+        }
+        .into(),
+        SelectControlType {
+            message_id: id("m1"),
+            control_type: ControlType::FillRateBasedControl,
+        }
+        .into(),
+        SessionRequest {
+            message_id: id("m1"),
+            request: SessionRequestType::Terminate,
+            diagnostic_label: Some("shutting down".into()),
+        }
+        .into(),
+        ReceptionStatus {
+            subject_message_id: id("m1"),
+            status: ReceptionStatusValues::Ok,
+            diagnostic_label: Some("Processed okay.".into()),
+        }
+        .into(),
+        InstructionStatusUpdate {
+            message_id: id("m1"),
+            instruction_id: id("instr0"),
+            status_type: InstructionStatus::Succeeded,
+            timestamp: at(),
+        }
+        .into(),
+        PowerMeasurement {
+            message_id: id("m1"),
+            measurement_timestamp: at(),
+            values: vec![PowerValue::new(q(), 510.6)],
+        }
+        .into(),
+        PowerForecast {
+            message_id: id("m1"),
+            start_time: at(),
+            elements: vec![PowerForecastElement {
+                duration: Duration::from_millis(3_600_000),
+                power_values: vec![forecast_value()],
+            }],
+        }
+        .into(),
+        RevokeObject {
+            message_id: id("m1"),
+            object_type: RevokableObjects::FrbcSystemDescription,
+            object_id: id("sd1"),
+        }
+        .into(),
+        // --- PEBC ---
+        pebc::PowerConstraints {
+            message_id: id("m1"),
+            id: id("powerConstraint1"),
+            valid_from: at(),
+            valid_until: Some(at()),
+            consequence_type: pebc::PowerEnvelopeConsequenceType::Vanish,
+            allowed_limit_ranges: vec![
+                pebc::AllowedLimitRange {
+                    commodity_quantity: q(),
+                    limit_type: pebc::PowerEnvelopeLimitType::LowerLimit,
+                    range_boundary: NumberRange::new(-4000.0, 0.0),
+                    abnormal_condition_only: false,
+                },
+                pebc::AllowedLimitRange {
+                    commodity_quantity: q(),
+                    limit_type: pebc::PowerEnvelopeLimitType::UpperLimit,
+                    range_boundary: NumberRange::new(0.0, 0.0),
+                    abnormal_condition_only: false,
+                },
+            ],
+        }
+        .into(),
+        pebc::EnergyConstraint {
+            message_id: id("m1"),
+            id: id("energyconstraint1"),
+            valid_from: at(),
+            valid_until: at(),
+            upper_average_power: 3000.0,
+            lower_average_power: 1000.0,
+            commodity_quantity: q(),
+        }
+        .into(),
+        pebc::Instruction {
+            message_id: id("m1"),
+            id: id("envelope1"),
+            execution_time: at(),
+            abnormal_condition: false,
+            power_constraints_id: id("powerConstraint1"),
+            power_envelopes: vec![pebc::PowerEnvelope {
+                id: id("pe_xxx"),
+                commodity_quantity: q(),
+                power_envelope_elements: vec![pebc::PowerEnvelopeElement::new(
+                    Duration::from_millis(3_600_000),
+                    -2000.0,
+                    0.0,
+                )],
+            }],
+        }
+        .into(),
+        // --- PPBC ---
+        ppbc::PowerProfileDefinition {
+            message_id: id("m1"),
+            id: id("profile1"),
+            start_time: at(),
+            end_time: at(),
+            power_sequence_containers: vec![ppbc::PowerSequenceContainer {
+                id: id("c1"),
+                power_sequences: vec![ppbc::PowerSequence {
+                    id: id("s1"),
+                    elements: vec![ppbc::PowerSequenceElement {
+                        duration: Duration::from_secs(600),
+                        power_values: vec![forecast_value()],
+                    }],
+                    is_interruptible: true,
+                    max_pause_before: Some(Duration::from_secs(300)),
+                    abnormal_condition_only: false,
+                }],
+            }],
+        }
+        .into(),
+        ppbc::PowerProfileStatus {
+            message_id: id("m1"),
+            sequence_container_status: vec![ppbc::PowerSequenceContainerStatus {
+                power_profile_id: id("profile1"),
+                sequence_container_id: id("c1"),
+                selected_sequence_id: Some(id("s1")),
+                progress: Some(Duration::from_secs(60)),
+                status: ppbc::PowerSequenceStatus::Executing,
+            }],
+        }
+        .into(),
+        ppbc::ScheduleInstruction {
+            message_id: id("m1"),
+            id: id("instr0"),
+            power_profile_id: id("profile1"),
+            sequence_container_id: id("c1"),
+            power_sequence_id: id("s1"),
+            execution_time: at(),
+            abnormal_condition: false,
+        }
+        .into(),
+        ppbc::StartInterruptionInstruction {
+            message_id: id("m1"),
+            id: id("instr1"),
+            power_profile_id: id("profile1"),
+            sequence_container_id: id("c1"),
+            power_sequence_id: id("s1"),
+            execution_time: at(),
+            abnormal_condition: false,
+        }
+        .into(),
+        ppbc::EndInterruptionInstruction {
+            message_id: id("m1"),
+            id: id("instr2"),
+            power_profile_id: id("profile1"),
+            sequence_container_id: id("c1"),
+            power_sequence_id: id("s1"),
+            execution_time: at(),
+            abnormal_condition: false,
+        }
+        .into(),
+        // --- OMBC ---
+        ombc::SystemDescription {
+            message_id: id("m1"),
+            valid_from: at(),
+            operation_modes: vec![ombc::OperationMode {
+                id: id("om0"),
+                diagnostic_label: Some("Off".into()),
+                power_ranges: vec![power_range()],
+                running_costs: Some(NumberRange::new(0.0, 0.0)),
+                abnormal_condition_only: false,
+            }],
+            transitions: vec![transition("om0", "om0")],
+            timers: vec![timer()],
+        }
+        .into(),
+        ombc::Status {
+            message_id: id("m1"),
+            active_operation_mode_id: id("om0"),
+            operation_mode_factor: 0.5,
+            previous_operation_mode_id: Some(id("om1")),
+            transition_timestamp: Some(at()),
+        }
+        .into(),
+        ombc::TimerStatus {
+            message_id: id("m1"),
+            timer_id: id("timer0"),
+            finished_at: at(),
+        }
+        .into(),
+        ombc::Instruction {
+            message_id: id("m1"),
+            id: id("instr0"),
+            execution_time: at(),
+            operation_mode_id: id("om0"),
+            operation_mode_factor: 1.0,
+            abnormal_condition: false,
+        }
+        .into(),
+        // --- FRBC ---
+        frbc::SystemDescription {
+            message_id: id("m1"),
+            valid_from: at(),
+            actuators: vec![frbc_actuator()],
+            storage: frbc::StorageDescription {
+                diagnostic_label: Some("DHW Buffer".into()),
+                fill_level_label: Some("temperature in Celsius".into()),
+                provides_leakage_behaviour: true,
+                provides_fill_level_target_profile: true,
+                provides_usage_forecast: true,
+                fill_level_range: number_range(),
+            },
+        }
+        .into(),
+        frbc::StorageStatus {
+            message_id: id("m1"),
+            present_fill_level: 52.0,
+        }
+        .into(),
+        frbc::ActuatorStatus {
+            message_id: id("m1"),
+            actuator_id: id("actuator1"),
+            active_operation_mode_id: id("om0"),
+            operation_mode_factor: 0.0,
+            previous_operation_mode_id: Some(id("om1")),
+            transition_timestamp: Some(at()),
+        }
+        .into(),
+        frbc::TimerStatus {
+            message_id: id("m1"),
+            timer_id: id("timer0"),
+            actuator_id: id("actuator1"),
+            finished_at: at(),
+        }
+        .into(),
+        frbc::LeakageBehaviour {
+            message_id: id("m1"),
+            valid_from: at(),
+            elements: vec![frbc::LeakageBehaviourElement {
+                fill_level_range: number_range(),
+                leakage_rate: 0.000_05,
+            }],
+        }
+        .into(),
+        frbc::UsageForecast {
+            message_id: id("m1"),
+            start_time: at(),
+            elements: vec![frbc::UsageForecastElement {
+                duration: Duration::from_secs(900),
+                usage_rate_upper_limit: Some(1.0),
+                usage_rate_upper_95ppr: Some(0.9),
+                usage_rate_upper_68ppr: Some(0.8),
+                usage_rate_expected: 0.5,
+                usage_rate_lower_68ppr: Some(0.4),
+                usage_rate_lower_95ppr: Some(0.2),
+                usage_rate_lower_limit: Some(0.0),
+            }],
+        }
+        .into(),
+        frbc::FillLevelTargetProfile {
+            message_id: id("m1"),
+            start_time: at(),
+            elements: vec![frbc::FillLevelTargetProfileElement {
+                duration: Duration::from_secs(3600),
+                fill_level_range: number_range(),
+            }],
+        }
+        .into(),
+        frbc::Instruction {
+            message_id: id("m1"),
+            id: id("instr0"),
+            actuator_id: id("actuator1"),
+            operation_mode: id("om0"),
+            operation_mode_factor: 1.0,
+            execution_time: at(),
+            abnormal_condition: false,
+        }
+        .into(),
+        // --- DDBC ---
+        ddbc::SystemDescription {
+            message_id: id("m1"),
+            valid_from: at(),
+            actuators: vec![ddbc_actuator()],
+            present_demand_rate: None,
+            provides_average_demand_rate_forecast: true,
+        }
+        .into(),
+        ddbc::ActuatorStatus {
+            message_id: id("m1"),
+            actuator_id: id("actuator1"),
+            active_operation_mode_id: id("om0"),
+            operation_mode_factor: 0.5,
+            previous_operation_mode_id: Some(id("om1")),
+            transition_timestamp: Some(at()),
+        }
+        .into(),
+        ddbc::TimerStatus {
+            message_id: id("m1"),
+            timer_id: id("timer0"),
+            actuator_id: id("actuator1"),
+            finished_at: at(),
+        }
+        .into(),
+        ddbc::AverageDemandRateForecast {
+            message_id: id("m1"),
+            start_time: at(),
+            elements: vec![ddbc::AverageDemandRateForecastElement {
+                duration: Duration::from_secs(900),
+                demand_rate_upper_limit: Some(1.0),
+                demand_rate_upper_95ppr: Some(0.9),
+                demand_rate_upper_68ppr: Some(0.8),
+                demand_rate_expected: 0.5,
+                demand_rate_lower_68ppr: Some(0.4),
+                demand_rate_lower_95ppr: Some(0.2),
+                demand_rate_lower_limit: Some(0.0),
+            }],
+        }
+        .into(),
+        ddbc::PresentDemandStatus {
+            message_id: id("m1"),
+            present_demand_rate: NumberRange::new(0.0, 6000.0),
+        }
+        .into(),
+        ddbc::Instruction {
+            message_id: id("m1"),
+            id: id("instr0"),
+            execution_time: at(),
+            abnormal_condition: false,
+            actuator_id: id("actuator1"),
+            operation_mode_id: id("om0"),
+            operation_mode_factor: 1.0,
+        }
+        .into(),
+    ]
 }

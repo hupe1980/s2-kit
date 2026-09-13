@@ -30,7 +30,7 @@ mod lan;
 mod pairing;
 mod session;
 
-pub use http::{Error, Status};
+pub use http::{Error, MAX_RESPONSE_BYTES, Status};
 pub use lan::LanClient;
 pub use pairing::{Paired, Pairing};
 pub use session::Session;

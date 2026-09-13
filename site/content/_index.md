@@ -1,6 +1,6 @@
 +++
 title = "s2-kit"
-description = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: a data model proven against the official JSON schemas, a 61-rule semantic validator, sans-I/O session engines for both CEM and RM, and S2 Connect from discovery to an authorised WebSocket."
+description = "The S2 energy flexibility standard (EN 50491-12-2) in Rust: a data model proven against the official JSON schemas, a 65-rule semantic validator, sans-I/O session engines for both CEM and RM, and S2 Connect from discovery to an authorised WebSocket."
 template = "index.html"
 +++
 
@@ -66,7 +66,7 @@ documents are present, checked by a tool that reads the standard's own documenta
 
 ### A semantic validator
 
-61 numbered rules, each quoting the sentence of the standard it implements, each with a
+65 numbered rules, each quoting the sentence of the standard it implements, each with a
 test that fires it. The rule identifier travels in the `diagnostic_label` of every
 failing `ReceptionStatus`, so a refusal is greppable across a fleet rather than a
 mystery — and `s2-kit replay` runs the whole catalogue over a recorded conversation.
@@ -88,6 +88,16 @@ timer that blocks a transition are ordinary unit tests that run in microseconds.
 Discovery over DNS-SD, the mutual HMAC challenge–response with its certificate binding,
 the per-node rate limit, the two-phase token commit, and an `axum` endpoint — through to
 the WebSocket the communication token opens, over a real TLS connection.
+
+</div>
+<div>
+
+### Tested against implementations it did not write
+
+The official crate is linked and every message round-tripped through its model; the
+official example Resource Managers are built and talked to over a real socket. Five
+defects in them are caught by it — including that the official crate cannot read 25 of
+the 43 messages in the standard's own published walkthroughs.
 
 </div>
 </div>
@@ -119,7 +129,7 @@ assert_eq!(hello.kind, MessageKind::Handshake);
 - **[Get started](@/docs/getting-started.md)** — install it and run a conversation with no
   network at all.
 - **[Guide](@/docs/_index.md)** — validation, sessions, and S2 Connect explained.
-- **[Rule catalogue](@/reference/rules.md)** — all 61 rules and their sources.
+- **[Rule catalogue](@/reference/rules.md)** — all 65 rules and their sources.
 - **[Conformance](@/reference/conformance.md)** — what is implemented, and what is not
   claimed.
 - **[Errata](@/docs/errata.md)** — the rough edges found in the specification, and how

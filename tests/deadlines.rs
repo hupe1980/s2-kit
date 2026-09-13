@@ -259,3 +259,39 @@ fn an_s2_connect_session_has_no_handshake_deadline_at_all() {
     assert!(!deadlines.is_empty(), "the details are still acknowledged");
     assert_eq!(rm.poll_timeout(), None);
 }
+
+#[test]
+fn the_reconnection_ceiling_grows_with_the_attempt_the_application_counts() {
+    // A session is one connection, so the engine cannot count failed reconnections: it
+    // is the application that dials again. Without carrying the number across, every
+    // `Closed` event recommended the same two-second ceiling for ever — which is a
+    // back-off that does not back off, and exactly what `S2C §Reconnection strategy`
+    // (`delay_n = random(0, min(600 s, 2 s · 2^n))`) exists to avoid.
+    let now: Timestamp = "2024-01-01T12:00:00Z".parse().unwrap();
+    let ceilings: Vec<Option<Duration>> = (0..4)
+        .map(|attempt| {
+            let config = RmConfig::default().after_failed_attempts(attempt);
+            let mut rm = RmSession::new(config, s2_kit::testing::battery_details());
+            rm.open(now);
+            rm.transport_closed(now);
+            rm.poll_event()
+                .into_iter()
+                .find_map(|e| match e {
+                    RmEvent::Closed {
+                        reconnect_after, ..
+                    } => Some(reconnect_after),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect();
+    assert_eq!(
+        ceilings,
+        vec![
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(4)),
+            Some(Duration::from_secs(8)),
+            Some(Duration::from_secs(16)),
+        ]
+    );
+}

@@ -35,8 +35,11 @@ The engine does it once:
 
 ```text
 FRBC.Instruction instr0 on actuator1 → Charging (charge) at factor 0.6,
-  ElectricPower3PhaseSymmetric 3000 W, filling at 0.0015/s
+  ELECTRIC.POWER.3_PHASE_SYMMETRIC 3000 W, filling at 0.0015/s
 ```
+
+The unit is read off the quantity (`CommodityQuantity::unit()`), not appended as `W`:
+`HEAT.TEMPERATURE` is degrees Celsius and is not a power at all.
 
 …and says when it *cannot* be carried out:
 
@@ -47,7 +50,11 @@ FRBC.Instruction instr0 on actuator1 → Charging (charge) at factor 0.6,
 ## What the engine remembers
 
 - **The state table.** `S2C` says what may be sent when. The engine refuses outbound
-  messages at the call site and answers inbound ones with `INVALID_CONTENT`.
+  messages at the call site and answers inbound ones with `INVALID_CONTENT`. It has one
+  row the standard's own table does not: until a bare-WebSocket session has finished its
+  `Handshake`, neither side has agreed which schema the next message is to be read
+  against, so nothing but the handshake crosses. A session opened `pre_negotiated` —
+  which is what S2 Connect gives you — skips that row entirely.
 - **Validity windows.** A description with a `valid_from` in the future is scheduled, and
   becomes effective at the right moment — `poll_timeout` returns that moment.
 - **Timers.** A blocked transition is reported as blocked, with the timer's name. Timers
@@ -82,8 +89,11 @@ fleet.open_all(Timestamp::now());
 if let Some(deadline) = fleet.poll_timeout() {
     fleet.handle_timeout(deadline);
 }
+// The key is cloned, so a drain can be acted on: write the frame to the socket you
+// look up by that key, or close the session that just emitted it.
 for (device, out) in fleet.drain_transmit() {
-    let _ = (device, out);
+    let _ = fleet.get_mut(&device);
+    let _ = out;
 }
 ```
 
@@ -109,6 +119,26 @@ Counters rather than a `Metrics` trait, because a hook you have to implement to 
 number the session already has is a hook. The *sum* of the round trips is what is stored —
 a sum can be added up across a fleet and a mean cannot — with `mean_ack_latency_ms()`
 derived from it.
+
+## Reconnecting
+
+`Closed { reconnect_after }` is the `Backoff` **ceiling** for the attempt, not a delay
+already randomised — the core draws no random numbers. A session is one connection and so
+cannot count what happens after it, which is why the attempt number goes back in:
+
+```rust,ignore
+let mut attempt = 0;
+loop {
+    let mut rm = RmSession::new(RmConfig::default().after_failed_attempts(attempt), details.clone());
+    // …run it…
+    // Reached `Connected`? reset. Never got there? one more.
+    attempt = if reached_connected { 0 } else { attempt + 1 };
+}
+```
+
+Without it every close would recommend the same two seconds for ever, which is a back-off
+that does not back off. Under S2 Connect, `connect::client::Session::backoff()` draws the
+random delay `S2C §Reconnection strategy` prescribes from that ceiling.
 
 ## An idle session goes quiet
 

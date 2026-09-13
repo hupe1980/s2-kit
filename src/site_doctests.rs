@@ -87,8 +87,11 @@ struct site_content_docs_getting_started_md_1;
 /// if let Some(deadline) = fleet.poll_timeout() {
 ///     fleet.handle_timeout(deadline);
 /// }
+/// // The key is cloned, so a drain can be acted on: write the frame to the socket you
+/// // look up by that key, or close the session that just emitted it.
 /// for (device, out) in fleet.drain_transmit() {
-///     let _ = (device, out);
+///     let _ = fleet.get_mut(&device);
+///     let _ = out;
 /// }
 /// ```
 #[allow(non_snake_case, dead_code)]

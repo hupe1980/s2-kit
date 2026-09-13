@@ -144,27 +144,36 @@ impl<K: Ord, S: Session> SessionSet<K, S> {
 
     /// Everything every session wants to send, tagged with whose it is.
     ///
-    /// Collected rather than lazily iterated, so the caller can hold the frames while
-    /// mutating the set — closing a session, say, in response to what it just emitted.
-    pub fn drain_transmit(&mut self) -> Vec<(&K, Outgoing)>
+    /// The key is **cloned**, not borrowed. Draining and then acting on what was drained
+    /// is the only thing a caller does with the result — write the frame to the socket it
+    /// looks up by that key, close the session that just emitted it, remove one whose
+    /// transport has gone — and a borrowed key would hold the set immutably for exactly as
+    /// long as the result lives.
+    pub fn drain_transmit(&mut self) -> Vec<(K, Outgoing)>
     where
         K: Clone,
     {
         let mut out = Vec::new();
         for (key, session) in &mut self.sessions {
             while let Some(frame) = session.poll_transmit() {
-                out.push((key, frame));
+                out.push((key.clone(), frame));
             }
         }
         out
     }
 
     /// Everything every session wants to tell the application, tagged with whose it is.
-    pub fn drain_events(&mut self) -> Vec<(&K, S::Event)> {
+    ///
+    /// Cloned for the same reason [`drain_transmit`](Self::drain_transmit) clones: acting
+    /// on an event usually means touching the set the event came from.
+    pub fn drain_events(&mut self) -> Vec<(K, S::Event)>
+    where
+        K: Clone,
+    {
         let mut out = Vec::new();
         for (key, session) in &mut self.sessions {
             while let Some(event) = session.poll_event() {
-                out.push((key, event));
+                out.push((key.clone(), event));
             }
         }
         out
@@ -209,6 +218,23 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_can_be_acted_on_while_the_set_is_still_there() {
+        // The reason the keys are cloned: draining and then acting on what was drained is
+        // the only thing a caller ever does with the result, and every one of those
+        // actions needs the set back.
+        let mut set = fleet();
+        set.open_all(t(0));
+        let frames = set.drain_transmit();
+        assert_eq!(frames.len(), 2, "one handshake each");
+        for (key, frame) in frames {
+            assert!(frame.text.contains("Handshake"));
+            // Borrowed keys would have made this line a borrow-check error.
+            set.get_mut(&key).expect("still there").close();
+        }
+        assert_eq!(set.retain_open(), 2);
+    }
+
+    #[test]
     fn a_fleet_has_one_deadline_not_a_thousand() {
         let mut set = fleet();
         set.open_all(t(0));
@@ -229,7 +255,7 @@ mod tests {
         set.handle_timeout(deadline);
         // Both sessions reacted, not just the first one found.
         let events = set.drain_events();
-        let mut keys: Vec<&String> = events.iter().map(|(k, _)| *k).collect();
+        let mut keys: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), 2, "both sessions should have timed out");

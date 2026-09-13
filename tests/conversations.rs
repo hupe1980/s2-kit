@@ -918,3 +918,149 @@ fn a_closed_session_answers_nothing_at_all() {
     );
     assert_eq!(c.rm.poll_timeout(), None);
 }
+
+#[test]
+fn nothing_crosses_before_the_two_sides_have_agreed_a_version() {
+    // `S2C §State of communication` starts at `WebSocketConnected` because under S2
+    // Connect the version is settled before the socket opens. A bare-WebSocket session
+    // has a row before that one — `S2J messages/Handshake` — and a message sent in it is
+    // a message whose *schema version* nobody has agreed on yet.
+    //
+    // The state table used to be keyed by the active control type alone, so `Idle`,
+    // `Handshaking` and `Connected` were one row: an RM could put a `PowerMeasurement` on
+    // the wire before it had opened the session at all, and the check named after the
+    // state never looked at one.
+    let mut rm =
+        s2_kit::session::RmSession::new(RmConfig::default(), s2_kit::testing::battery_details());
+    let now = at("2024-01-01T12:00:00Z");
+    let measurement = PowerMeasurement {
+        message_id: Id::parse("pm1").unwrap(),
+        measurement_timestamp: now,
+        values: vec![PowerValue::new(
+            CommodityQuantity::ElectricPower3PhaseSymmetric,
+            10.0,
+        )],
+    };
+
+    // Before `open`, and while the handshake is in flight.
+    assert!(matches!(
+        rm.send(measurement.clone(), now),
+        Err(s2_kit::session::SendError::NotAllowed { .. })
+    ));
+    rm.open(now);
+    assert!(matches!(rm.state(), SessionState::Handshaking));
+    assert!(matches!(
+        rm.send(measurement.clone(), now),
+        Err(s2_kit::session::SendError::NotAllowed { .. })
+    ));
+
+    // And a peer that sends one early is told which rule it broke, rather than having it
+    // quietly folded into the session's picture of the resource.
+    let early = r#"{"message_type":"SelectControlType","message_id":"m9",
+        "control_type":"FILL_RATE_BASED_CONTROL"}"#;
+    let inbound = rm.handle_text(early, now);
+    assert!(inbound.report.contains(rules::NOT_ALLOWED_IN_STATE));
+    assert!(matches!(rm.state(), SessionState::Handshaking));
+
+    // Once the version is agreed, the same message is fine.
+    rm.handle_text(
+        r#"{"message_type":"HandshakeResponse","message_id":"h1",
+            "selected_protocol_version":"1.0.0"}"#,
+        now,
+    );
+    assert!(matches!(rm.state(), SessionState::Connected));
+    assert!(rm.send(measurement, now).is_ok());
+}
+
+#[test]
+fn a_session_under_s2_connect_is_connected_the_moment_it_opens() {
+    // The counterpart: S2 Connect settles the version during session initiation, so there
+    // is no negotiating row at all and the resource may describe itself immediately.
+    let config = RmConfig::default().pre_negotiated(WireProfile::V1_0_0);
+    let mut rm = s2_kit::session::RmSession::new(config, s2_kit::testing::battery_details());
+    let now = at("2024-01-01T12:00:00Z");
+    rm.open(now);
+    assert!(matches!(rm.state(), SessionState::Connected));
+    assert!(
+        rm.send(
+            PowerMeasurement {
+                message_id: Id::parse("pm1").unwrap(),
+                measurement_timestamp: now,
+                values: vec![PowerValue::new(
+                    CommodityQuantity::ElectricPower3PhaseSymmetric,
+                    10.0,
+                )],
+            },
+            now,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_side_hears_its_own_validators_warnings_about_what_it_sent() {
+    // `validate_outbound` refuses an outbound message with an *error* at the call site,
+    // which is the point of it — and it learned everything the warning rules had to say
+    // and threw it away. A manager instructing a transition its own picture of the timers
+    // says is blocked (`S2-INST-005`, a warning because that picture is always slightly
+    // stale) had no way to find out except by being told by a peer.
+    let mut c = Conversation::battery();
+    c.open();
+    c.cem
+        .select_control_type(ControlType::FillRateBasedControl, c.now)
+        .unwrap();
+    c.pump();
+    c.rm.send(battery_system(c.now), c.now).unwrap();
+    c.pump();
+
+    // Discharge, then report the cooldown timer as running: `t4` (discharge → idle) is
+    // blocked by it.
+    c.rm.send(
+        s2_kit::types::frbc::ActuatorStatus {
+            message_id: Id::parse("as1").unwrap(),
+            actuator_id: Id::parse("actuator1").unwrap(),
+            active_operation_mode_id: Id::parse("discharge").unwrap(),
+            operation_mode_factor: 0.5,
+            previous_operation_mode_id: None,
+            transition_timestamp: None,
+        },
+        c.now,
+    )
+    .unwrap();
+    c.rm.send(
+        s2_kit::types::frbc::TimerStatus {
+            message_id: Id::parse("ts1").unwrap(),
+            timer_id: Id::parse("cooldown").unwrap(),
+            actuator_id: Id::parse("actuator1").unwrap(),
+            finished_at: c.now.checked_add(Duration::from_secs(600)).unwrap(),
+        },
+        c.now,
+    )
+    .unwrap();
+    c.pump();
+    let _ = c.take_cem_events();
+
+    // Now the manager instructs the blocked transition. It goes out — the rule is a
+    // warning, and the RM may well have moved on — but the manager is told.
+    c.cem
+        .instruct(
+            s2_kit::types::frbc::Instruction {
+                message_id: Id::parse("mi9").unwrap(),
+                id: Id::parse("instr9").unwrap(),
+                actuator_id: Id::parse("actuator1").unwrap(),
+                operation_mode: Id::parse("idle").unwrap(),
+                operation_mode_factor: 0.0,
+                execution_time: c.now,
+                abnormal_condition: false,
+            },
+            c.now,
+        )
+        .expect("a warning does not refuse the send");
+
+    let warned = c.take_cem_events().into_iter().any(|e| {
+        matches!(e, CemEvent::OutboundWarnings { report, .. }
+            if report.contains(rules::BLOCKED_BY_TIMER))
+    });
+    assert!(warned, "the sender should hear its own validator");
+    assert_eq!(c.cem.stats().sent_with_warnings, 1);
+}

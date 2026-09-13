@@ -99,12 +99,36 @@ pub enum ResolveError {
     /// The instruction names a profile, container or sequence that was never published.
     #[error("{0} was never published")]
     UnknownSequence(Id),
+    /// A set of choices does not name each of the profile's containers exactly once, in
+    /// the order the profile lists them.
+    ///
+    /// Array order **is** execution order
+    /// (`S2J messages/PPBC.PowerProfileDefinition.power_sequences_containers`), so a set
+    /// of choices that skips a container, repeats one or reorders them does not describe
+    /// a runnable schedule — and silently scheduling it in the order it was written would
+    /// answer a question nobody asked.
+    #[error("choice {position} names {found:?}, but the profile's container there is {expected}")]
+    WrongContainer {
+        /// Where in the list the mismatch is.
+        position: usize,
+        /// The container the profile lists at that position.
+        expected: Id,
+        /// What was chosen there, if anything.
+        found: Option<Id>,
+    },
     /// The factor is outside `[0, 1]`.
     #[error("operation mode factor {0} is outside [0, 1]")]
     BadFactor(f64),
     /// No element of the operation mode covers the present fill level.
     #[error("no element of this operation mode covers a fill level of {0}")]
     FillLevelNotCovered(f64),
+    /// No system description for this control type has been seen on this session.
+    ///
+    /// Not a defect in the instruction: an instruction that arrives before the
+    /// description it refers to cannot be read, and saying so is different from saying
+    /// the instruction is wrong.
+    #[error("no system description for this control type has been seen")]
+    NotDescribed,
 }
 
 /// The power a set of ranges implies at a factor.
@@ -371,10 +395,11 @@ pub fn resolve_ddbc<'a>(
     })
 }
 
-/// Which actuators and modes together meet a demand, cheapest supply first.
+/// The whole span of demand one actuator can supply, across all of its operation modes.
 ///
-/// A convenience for a CEM driving a hybrid system: it answers "what combination of
-/// modes supplies at least this much?" without prescribing a policy.
+/// The union of every mode's `supply_range`, so a CEM driving a hybrid system can ask
+/// "could this actuator meet the demand at all?" before working out which mode does it.
+/// An actuator with no operation modes answers `0..0`.
 #[must_use]
 pub fn supply_range_of(actuator: &ddbc::ActuatorDescription) -> NumberRange {
     let mut low = f64::INFINITY;
@@ -553,20 +578,34 @@ impl SequenceWindow {
 /// each window but not folded into it: it bounds the gap between two starts, so it can
 /// only reject a schedule. [`starts_are_feasible`] applies it.
 ///
-/// `chosen` names one sequence per container, in container order; every container must
-/// appear.
+/// `chosen` names one sequence per container, **in the order the profile lists the
+/// containers**; every container must appear exactly once. A list that skips, repeats or
+/// reorders a container is [`ResolveError::WrongContainer`] rather than a schedule for a
+/// profile nobody published.
 pub fn schedule(
     profile: &ppbc::PowerProfileDefinition,
     chosen: &[(Id, Id)],
 ) -> Result<Vec<SequenceWindow>, ResolveError> {
-    if chosen.len() != profile.power_sequence_containers.len() {
-        // Naming the first container with no choice is more useful than a count.
-        let missing = profile
-            .power_sequence_containers
-            .iter()
-            .find(|c| !chosen.iter().any(|(container, _)| container == &c.id))
-            .map_or(profile.id, |c| c.id);
-        return Err(ResolveError::UnknownSequence(missing));
+    // Position by position against the profile's own order, so a skipped container, a
+    // repeated one and a swapped pair are all caught, and all name the container the
+    // profile expected there.
+    for (position, container) in profile.power_sequence_containers.iter().enumerate() {
+        let found = chosen.get(position).map(|(id, _)| *id);
+        if found != Some(container.id) {
+            return Err(ResolveError::WrongContainer {
+                position,
+                expected: container.id,
+                found,
+            });
+        }
+    }
+    if chosen.len() > profile.power_sequence_containers.len() {
+        let position = profile.power_sequence_containers.len();
+        return Err(ResolveError::WrongContainer {
+            position,
+            expected: profile.id,
+            found: chosen.get(position).map(|(id, _)| *id),
+        });
     }
 
     let mut resolved = Vec::with_capacity(chosen.len());
@@ -625,9 +664,16 @@ pub fn is_schedulable(profile: &ppbc::PowerProfileDefinition, chosen: &[(Id, Id)
 }
 
 /// Why a concrete set of start times will not do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ScheduleProblem {
+    /// The choices do not describe the profile at all, so there is nothing to time.
+    ///
+    /// Kept distinct from [`WrongCount`](Self::WrongCount): "you named a sequence that
+    /// does not exist" and "you gave me four start times for three sequences" are
+    /// different mistakes, and collapsing them reports the second for the first.
+    #[error("{0}")]
+    NotSchedulable(ResolveError),
     /// One start time per chosen sequence is needed, and a different number was given.
     #[error("{given} start times for {needed} sequences")]
     WrongCount {
@@ -681,10 +727,7 @@ pub fn starts_are_feasible(
     chosen: &[(Id, Id)],
     starts: &[Timestamp],
 ) -> Result<(), ScheduleProblem> {
-    let windows = schedule(profile, chosen).map_err(|_| ScheduleProblem::WrongCount {
-        given: starts.len(),
-        needed: chosen.len(),
-    })?;
+    let windows = schedule(profile, chosen).map_err(ScheduleProblem::NotSchedulable)?;
     if starts.len() != windows.len() {
         return Err(ScheduleProblem::WrongCount {
             given: starts.len(),
@@ -1202,8 +1245,50 @@ mod tests {
         let partial = [(Id::new_const("c1"), Id::new_const("sq"))];
         assert_eq!(
             schedule(&profile, &partial),
-            Err(ResolveError::UnknownSequence(Id::new_const("c2")))
+            Err(ResolveError::WrongContainer {
+                position: 1,
+                expected: Id::new_const("c2"),
+                found: None,
+            })
         );
+
+        // Array order is execution order, so choices given out of order describe a
+        // different schedule from the one the profile published — and a `schedule` that
+        // quietly honoured the caller's order would answer a question nobody asked.
+        let swapped = [
+            (Id::new_const("c2"), Id::new_const("sq")),
+            (Id::new_const("c1"), Id::new_const("sq")),
+            (Id::new_const("c3"), Id::new_const("sq")),
+        ];
+        assert_eq!(
+            schedule(&profile, &swapped),
+            Err(ResolveError::WrongContainer {
+                position: 0,
+                expected: Id::new_const("c1"),
+                found: Some(Id::new_const("c2")),
+            })
+        );
+
+        // And one container chosen twice is not two containers, however well the count
+        // lines up.
+        let doubled = [
+            (Id::new_const("c1"), Id::new_const("sq")),
+            (Id::new_const("c1"), Id::new_const("sq")),
+            (Id::new_const("c3"), Id::new_const("sq")),
+        ];
+        assert!(matches!(
+            schedule(&profile, &doubled),
+            Err(ResolveError::WrongContainer { position: 1, .. })
+        ));
+
+        // A start-time check on choices that do not describe the profile says *that*,
+        // rather than blaming the number of start times.
+        assert!(matches!(
+            starts_are_feasible(&profile, &partial, &back_to_back[..1]),
+            Err(ScheduleProblem::NotSchedulable(
+                ResolveError::WrongContainer { .. }
+            ))
+        ));
     }
 
     #[test]

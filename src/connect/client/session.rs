@@ -140,13 +140,14 @@ impl Session {
             // The store now holds the replacement. A caller that persists here survives a
             // crash before the confirmation; one that does not, does not.
             let confirm = self.machine.confirm()?;
+            // No request body: `S2C-OAS session-init/confirmAccessToken` defines none, and
+            // the bearer is the whole message.
             let details: CommunicationDetails = self
                 .http
-                .post::<(), _>(
+                .post_bodyless(
                     "confirmAccessToken",
                     CONFIRM_ACCESS_TOKEN,
                     Some(confirm.as_str()),
-                    &(),
                 )
                 .await?;
             let credentials = self.machine.connected(details, now)?;

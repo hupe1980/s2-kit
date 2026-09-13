@@ -60,8 +60,14 @@ All 36 messages of S2 JSON v1.0.0 are modelled, validated and routed.
 in each state. Both engines refuse an outbound message outside this table at the
 call site, and answer an inbound one with `INVALID_CONTENT`.
 
+The first row is not in the standard's own table, which starts at `WebSocket
+Connected` because S2 Connect settles the version before the socket opens. A bare
+WebSocket session has one row before that: until the `Handshake` has completed,
+neither side knows which schema the next message is to be read against.
+
 | State | CEM may send | RM may send |
 |---|---|---|
+| negotiating | `Handshake`, `HandshakeResponse`, `SessionRequest`, `ReceptionStatus` | `Handshake`, `SessionRequest`, `ReceptionStatus` |
 | connected | `Handshake`, `HandshakeResponse`, `SelectControlType`, `SessionRequest`, `ReceptionStatus` | `Handshake`, `ResourceManagerDetails`, `SessionRequest`, `ReceptionStatus`, `PowerMeasurement`, `PowerForecast` |
 | PowerEnvelopeBasedControl | `SelectControlType`, `SessionRequest`, `ReceptionStatus`, `RevokeObject`, `PEBC.Instruction` | `ResourceManagerDetails`, `SessionRequest`, `ReceptionStatus`, `InstructionStatusUpdate`, `PowerMeasurement`, `PowerForecast`, `RevokeObject`, `PEBC.PowerConstraints`, `PEBC.EnergyConstraint` |
 | PowerProfileBasedControl | `SelectControlType`, `SessionRequest`, `ReceptionStatus`, `RevokeObject`, `PPBC.ScheduleInstruction`, `PPBC.StartInterruptionInstruction`, `PPBC.EndInterruptionInstruction` | `ResourceManagerDetails`, `SessionRequest`, `ReceptionStatus`, `InstructionStatusUpdate`, `PowerMeasurement`, `PowerForecast`, `RevokeObject`, `PPBC.PowerProfileDefinition`, `PPBC.PowerProfileStatus` |
@@ -73,11 +79,11 @@ call site, and answer an inbound one with `INVALID_CONTENT`.
 
 ## Semantic validation
 
-61 rules — 42 errors, 19 warnings — each quoting the sentence it implements.
+65 rules — 45 errors, 20 warnings — each quoting the sentence it implements.
 The full catalogue is in the [rule reference](@/reference/rules.md); every one
 of them has a test that fires it.
 
-31 of them need session context — a rule that compares a message
+33 of them need session context — a rule that compares a message
 against what the peer said earlier cannot fire on a message read from a file.
 
 
@@ -108,15 +114,49 @@ binds to comes out of a genuine handshake.
 | DNS-SD advertise and browse, `_cem` / `_rm` subtypes | yes |
 | LAN-only operations: `/endpoint`, `/nodes`, `/preparePairing`, `/cancelPreparePairing` | yes |
 | The same-subnet check those operations require, v4 and v6 | yes |
-| Long-polling (`/waitForPairing`) | wire types only |
+| Long-polling (`/waitForPairing`), both halves: the client holds a request open, the server wakes it | yes |
 | WAN endpoint registry | no |
+
+## Interoperability
+
+Two kinds, because they find different things.
+
+**At the wire.** The official `s2energy` crate is a dev-dependency, and every one
+of the **35 messages of `0.0.2-beta`** — with every optional field set — is
+encoded here, re-encoded through its model and read back. Two results worth
+stating plainly: the official crate refuses **25 of the 43 messages in the
+standard's own published walkthroughs** because it models `ID` as a UUID, and it
+speaks only `0.0.2-beta` — it requires the field `v1.0.0` removed and has no
+variant for the message `v1.0.0` added. This crate reads all 43 and speaks both.
+
+That is also the limit of the exercise. **No other implementation implements
+`v1.0.0`**, so the two messages the tags disagree about have no second reading to
+be checked against; what they are checked against is the official JSON schema,
+which is the only other authority that exists for them.
+
+**As a conversation.** `cargo xtask interop` runs this crate's CEM against
+implementations nobody here wrote, over a real WebSocket. Each row records what
+that peer does **today**, so the job fails only when this crate regresses or a
+peer is fixed upstream.
+
+| Peer | Control type | Outcome |
+|---|---|---|
+| `s2-example-implementations/battery` | FRBC | peer defect, caught by `S2-INST-002` |
+| `s2-example-implementations/pv-installation` | PEBC | peer defect, caught by `S2-NUM-002` |
+| `s2-example-implementations/pv-installation` | NOT_CONTROLABLE | clean |
+
+The peer defects are described in the project's interop notes; in each case the
+schema is unambiguous. A matrix that only ever agreed would be the one to distrust.
 
 ## Not claimed
 
-* **Interoperability results.** Nothing here has been run against another
-  implementation in CI yet; when it has, the matrix will live in this file
-  and say which revision of which peer it was run against. Pairing this
-  crate against itself proves self-consistency, which is not the same thing.
+* **Interoperability beyond the matrix below.** `cargo xtask interop` runs this
+  crate's CEM against the FlexiblePower example Resource Managers over a real
+  socket. It does not yet reach `s2-python`, `cem-reference-1` or `s2-analyzer`
+  in the middle, it runs one role and one wire profile, and its peers speak bare
+  WebSocket — so it says nothing at all about S2 Connect against another
+  implementation. Pairing this crate against itself proves self-consistency,
+  which is not the same thing.
 * **Certification.** There is no S2 certification programme, and this
   document is not one.
 * **Deciding whether you are a LAN or a WAN endpoint.** `router` serves only

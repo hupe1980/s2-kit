@@ -348,10 +348,28 @@ impl Validate for InstructionStatusUpdate {
         check_observed(self.timestamp, &child(path, "timestamp"), ctx, out);
 
         if !ctx.instructions.is_empty() && !ctx.instructions.contains(&self.instruction_id) {
+            // An instruction carries two identifiers — its `message_id` and its own `id` —
+            // and `instruction_id` is "ID of this instruction (as provided by the CEM)",
+            // which is the second. Echoing the first is the commonest mistake there is
+            // here, and it is worth naming: the peer sees a rule id and a sentence that
+            // tells it exactly which field to change, rather than a `ReceptionStatus` it
+            // has to reverse-engineer.
+            let echoed = ctx
+                .instruction_messages
+                .iter()
+                .find(|(message_id, _)| *message_id == self.instruction_id);
+            let message = match echoed {
+                Some((_, instruction)) => format!(
+                    "{} is the message_id of the instruction whose id is {instruction}; \
+                     instruction_id must be the instruction's own id",
+                    self.instruction_id
+                ),
+                None => format!("{} was never sent on this session", self.instruction_id),
+            };
             out.push_related(
                 rules::UNKNOWN_INSTRUCTION,
                 &child(path, "instruction_id"),
-                format!("{} was never sent on this session", self.instruction_id),
+                message,
                 [self.instruction_id],
             );
         }
@@ -638,7 +656,7 @@ impl Validate for frbc::TimerStatus {
                     [self.actuator_id],
                 ),
                 Some(actuator) if actuator.timer(&self.timer_id).is_none() => out.push_related(
-                    rules::FRBC_TRANSITION_REFERENCES,
+                    rules::UNKNOWN_TIMER,
                     &child(path, "timer_id"),
                     format!(
                         "{} is not a timer of actuator {}",
@@ -916,7 +934,7 @@ impl Validate for ombc::TimerStatus {
             && system.timer(&self.timer_id).is_none()
         {
             out.push_related(
-                rules::OMBC_TRANSITION_REFERENCES,
+                rules::UNKNOWN_TIMER,
                 &child(path, "timer_id"),
                 format!("{} is not a timer of this system", self.timer_id),
                 [self.timer_id],
@@ -991,6 +1009,27 @@ impl Validate for ddbc::SystemDescription {
         );
         if let Some(rate) = self.present_demand_rate {
             check_range(rate, &child(path, "present_demand_rate"), out);
+        }
+        // The one field the two tagged versions of S2 JSON disagree about. The codec
+        // enforces it on the way in; this is the same rule on the way out, so an
+        // endpoint learns at its own call site rather than from a peer's refusal (E13).
+        let carries = ctx.profile.ddbc_system_description_carries_demand_rate();
+        match (carries, self.present_demand_rate.is_some()) {
+            (true, false) => out.push(
+                rules::PROFILE_FIELD,
+                &child(path, "present_demand_rate"),
+                format!("present_demand_rate is required in S2 JSON {}", ctx.profile),
+            ),
+            (false, true) => out.push(
+                rules::PROFILE_FIELD,
+                &child(path, "present_demand_rate"),
+                format!(
+                    "present_demand_rate was removed in S2 JSON {}; \
+                     send DDBC.PresentDemandStatus instead",
+                    ctx.profile
+                ),
+            ),
+            _ => {}
         }
 
         let at = child(path, "actuators");
@@ -1152,7 +1191,7 @@ impl Validate for ddbc::TimerStatus {
                     [self.actuator_id],
                 ),
                 Some(actuator) if actuator.timer(&self.timer_id).is_none() => out.push_related(
-                    rules::DDBC_TRANSITION_REFERENCES,
+                    rules::UNKNOWN_TIMER,
                     &child(path, "timer_id"),
                     format!(
                         "{} is not a timer of actuator {}",
@@ -1492,7 +1531,10 @@ fn check_within_allowed(
         out.push(
             rules::PEBC_OUTSIDE_ALLOWED,
             path,
-            format!("the constraints allow no {limit_type:?} for {quantity:?}"),
+            format!(
+                "the constraints allow no {limit_type:?} for {}",
+                quantity.as_str()
+            ),
         );
     } else if !fits {
         if needs_abnormal {
@@ -1508,7 +1550,10 @@ fn check_within_allowed(
             out.push(
                 rules::PEBC_OUTSIDE_ALLOWED,
                 path,
-                format!("{value} is outside every allowed {limit_type:?} range for {quantity:?}"),
+                format!(
+                    "{value} is outside every allowed {limit_type:?} range for {}",
+                    quantity.as_str()
+                ),
             );
         }
     }
@@ -1549,6 +1594,9 @@ impl Validate for ppbc::PowerProfileDefinition {
             .end_time
             .checked_duration_since(self.start_time)
             .unwrap_or(crate::types::Duration::ZERO);
+        // The best case for the whole task: the shortest sequence of every container,
+        // run back to back. `None` once anything overflows or a container is empty.
+        let mut shortest_total = Some(crate::types::Duration::ZERO);
         for (i, container) in self.power_sequence_containers.iter().enumerate() {
             let container_path = index(&at, i);
             check_array(
@@ -1599,6 +1647,30 @@ impl Validate for ppbc::PowerProfileDefinition {
                     ),
                 );
             }
+            shortest_total = shortest_total
+                .zip(shortest)
+                .and_then(|(total, s)| total.checked_add(s));
+        }
+
+        // Containers run **in the order the profile lists them**
+        // (`S2J messages/PPBC.PowerProfileDefinition.power_sequences_containers`), so the
+        // window has to hold all of them end to end, not merely the longest one. Three
+        // one-hour containers in a two-hour window is a task no CEM can schedule, and
+        // checking each container against the whole window sees nothing wrong with it —
+        // which is the same mistake `model::schedule` exists to avoid (D32).
+        if let Some(total) = shortest_total
+            && total.as_millis() > window.as_millis()
+            && self.power_sequence_containers.len() > 1
+        {
+            out.push(
+                rules::PPBC_WINDOW_TOO_SHORT,
+                &at,
+                format!(
+                    "the containers run in order, so the shortest way to run all {} takes \
+                     {total}, but the window is only {window}",
+                    self.power_sequence_containers.len()
+                ),
+            );
         }
     }
 }
@@ -1615,21 +1687,26 @@ impl Validate for ppbc::PowerProfileStatus {
         let at = child(path, "sequence_container_status");
         for (i, status) in self.sequence_container_status.iter().enumerate() {
             let status_path = index(&at, i);
+            // Three separate conditions, three separate identifiers. The standard states
+            // one of them plainly, infers the second and states the third the other way
+            // round, so they cannot share a severity — nor a number a fleet counts (D28).
             let started = status.status.has_started();
             match (started, status.progress) {
                 (true, None) => out.push(
                     rules::PPBC_PROGRESS,
                     &status_path,
                     format!(
-                        "{:?} means the sequence has started, so progress must be present",
+                        "{:?} means the selected sequence has started, so progress must be present",
                         status.status
                     ),
                 ),
+                // "must be provided, unless …" permits omission; it does not forbid
+                // presence. A warning, so a conforming peer is not refused (D4).
                 (false, Some(_)) => out.push(
-                    rules::PPBC_PROGRESS,
+                    rules::PPBC_PROGRESS_UNEXPECTED,
                     &child(&status_path, "progress"),
                     format!(
-                        "{:?} means nothing has started, so progress must be absent",
+                        "{:?} means nothing has started yet, so progress says nothing",
                         status.status
                     ),
                 ),
@@ -1637,7 +1714,7 @@ impl Validate for ppbc::PowerProfileStatus {
             }
             if status.status.has_selection() && status.selected_sequence_id.is_none() {
                 out.push(
-                    rules::PPBC_PROGRESS,
+                    rules::PPBC_SEQUENCE_NOT_NAMED,
                     &status_path,
                     format!(
                         "{:?} means a sequence was chosen, so selected_sequence_id must be present",

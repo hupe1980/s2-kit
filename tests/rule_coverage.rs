@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use s2_kit::prelude::*;
 use s2_kit::session::{CemConfig, RmConfig};
 use s2_kit::testing::{Conversation, battery_system, charge};
-use s2_kit::validate::{Context, Report, RuleId, TimerState, Validate, rules};
+use s2_kit::validate::{Context, Phase, Report, RuleId, TimerState, Validate, rules};
 
 fn id(s: &str) -> Id {
     Id::parse(s).expect("a valid identifier")
@@ -474,7 +474,7 @@ fn cases() -> Vec<(RuleId, Report)> {
                 frbc_instruction("om1", 0.5),
                 &Context {
                     sender: Some(EnergyManagementRole::Cem),
-                    active_control_type: None,
+                    phase: Phase::Connected,
                     ..Context::empty()
                 },
             ),
@@ -624,7 +624,7 @@ fn cases() -> Vec<(RuleId, Report)> {
                 },
                 &Context {
                     sender: Some(EnergyManagementRole::Cem),
-                    active_control_type: Some(ControlType::FillRateBasedControl),
+                    phase: Phase::Activated(ControlType::FillRateBasedControl),
                     ..Context::empty()
                 },
             ),
@@ -952,6 +952,35 @@ fn cases() -> Vec<(RuleId, Report)> {
                 ..ppbc_profile(false)
             }),
         ),
+        // Progress for a sequence that has not started: a *warning*, because "must be
+        // provided, unless …" permits omission rather than forbidding presence.
+        (
+            rules::PPBC_PROGRESS_UNEXPECTED,
+            alone(ppbc::PowerProfileStatus {
+                message_id: id("m1"),
+                sequence_container_status: vec![ppbc::PowerSequenceContainerStatus {
+                    power_profile_id: id("p1"),
+                    sequence_container_id: id("c1"),
+                    selected_sequence_id: Some(id("s1")),
+                    progress: Some(Duration::ZERO),
+                    status: ppbc::PowerSequenceStatus::Scheduled,
+                }],
+            }),
+        ),
+        // A status that claims a selection without naming it.
+        (
+            rules::PPBC_SEQUENCE_NOT_NAMED,
+            alone(ppbc::PowerProfileStatus {
+                message_id: id("m1"),
+                sequence_container_status: vec![ppbc::PowerSequenceContainerStatus {
+                    power_profile_id: id("p1"),
+                    sequence_container_id: id("c1"),
+                    selected_sequence_id: None,
+                    progress: Some(Duration::from_secs(60)),
+                    status: ppbc::PowerSequenceStatus::Executing,
+                }],
+            }),
+        ),
         // --- OMBC --------------------------------------------------------------------
         (
             rules::OMBC_UNKNOWN_MODE,
@@ -989,6 +1018,32 @@ fn cases() -> Vec<(RuleId, Report)> {
                 vec![Transition::simple(id("t1"), id("om1"), id("ghost"))];
             alone(system)
         }),
+        // A status about a timer nobody declared. Its own rule rather than the transition
+        // rule's, because one identifier must mean one condition (D28).
+        (
+            rules::UNKNOWN_TIMER,
+            with(
+                ddbc::TimerStatus {
+                    message_id: id("m2"),
+                    timer_id: id("ghost"),
+                    actuator_id: id("a1"),
+                    finished_at: now(),
+                },
+                &ddbc_ctx,
+            ),
+        ),
+        // The one field the two tagged versions of S2 JSON disagree about, checked on the
+        // way *out* so an endpoint learns at its own call site (E13).
+        (
+            rules::PROFILE_FIELD,
+            with(
+                ddbc_system(None),
+                &Context {
+                    profile: WireProfile::V0_0_2Beta,
+                    ..Context::empty()
+                },
+            ),
+        ),
         (
             rules::DDBC_FORECAST_NOT_OFFERED,
             with(
@@ -1038,10 +1093,23 @@ fn engine_cases() -> Vec<(RuleId, Report)> {
 
     // A well-formed message carrying a property the schema does not define, read by a
     // proxy-style lenient session: forwarded, and the removal reported.
+    //
+    // The handshake has to be over first: `SelectControlType` before the two sides have
+    // agreed a version is `S2-STATE-001`, which would refuse the message for the wrong
+    // reason and cover nothing.
     let mut lenient = RmConfig::default();
     lenient.strictness = s2_kit::codec::Strictness::Lenient;
     let mut rm = s2_kit::session::RmSession::new(lenient, s2_kit::testing::battery_details());
     rm.open(now());
+    assert!(
+        rm.handle_text(
+            r#"{"message_type":"HandshakeResponse","message_id":"h1",
+                "selected_protocol_version":"1.0.0"}"#,
+            now(),
+        )
+        .accepted()
+    );
+    while rm.poll_event().is_some() {}
     let with_extra = r#"{"message_type":"SelectControlType","message_id":"m9",
         "control_type":"NO_SELECTION","vendor_extension":1}"#;
     assert!(rm.handle_text(with_extra, now()).accepted());
@@ -1057,13 +1125,21 @@ fn engine_cases() -> Vec<(RuleId, Report)> {
     // An application that cannot act right now.
     let mut rm =
         s2_kit::session::RmSession::new(RmConfig::default(), s2_kit::testing::battery_details());
+    rm.open(now());
+    // Past the handshake first, so what the policy refuses is a message the state table
+    // would otherwise have accepted — and so the policy does not refuse the handshake.
+    rm.handle_text(
+        r#"{"message_type":"HandshakeResponse","message_id":"h1",
+            "selected_protocol_version":"1.0.0"}"#,
+        now(),
+    );
+    while rm.poll_event().is_some() {}
     rm.set_inbound_policy(Box::new(|_: &Message| {
         Some((
             ReceptionStatusValues::TemporaryError,
             "the device is not reachable right now".to_string(),
         ))
     }));
-    rm.open(now());
     let refused = rm.handle_text(
         r#"{"message_type":"SelectControlType","message_id":"m9","control_type":"NO_SELECTION"}"#,
         now(),
@@ -1206,13 +1282,13 @@ fn every_rule_in_the_catalogue_has_a_case() {
 #[test]
 fn the_catalogue_is_the_size_the_documentation_claims() {
     // A number that cannot be moved by relabelling: it is the length of the table.
-    assert_eq!(rules::RULES.len(), 61);
+    assert_eq!(rules::RULES.len(), 65);
     let errors = rules::RULES
         .iter()
         .filter(|r| r.severity == s2_kit::validate::Severity::Error)
         .count();
     let warnings = rules::RULES.len() - errors;
-    assert_eq!((errors, warnings), (42, 19));
+    assert_eq!((errors, warnings), (45, 20));
 }
 
 #[test]
@@ -1259,4 +1335,71 @@ fn the_state_rules_are_what_a_session_actually_answers_with() {
     assert!(inbound.accepted(), "an RM description is fine at a CEM");
     let inbound = c.rm.handle_text(&wrong_way, c.now);
     assert!(inbound.report.contains(rules::NOT_ALLOWED_FOR_ROLE));
+}
+
+#[test]
+fn a_profile_whose_containers_cannot_all_fit_is_reported() {
+    // Containers run in the order the profile lists them, so the window has to hold all
+    // of them end to end. Checking each container against the *whole* window — which is
+    // all the rule used to do — sees nothing wrong with three one-hour containers in a
+    // two-hour window, and a CEM discovers it only when it tries to schedule them.
+    let hour = Duration::from_secs(3600);
+    let container = |name: &'static str| ppbc::PowerSequenceContainer {
+        id: id(name),
+        power_sequences: vec![ppbc::PowerSequence {
+            id: id("sq"),
+            elements: vec![ppbc::PowerSequenceElement {
+                duration: hour,
+                power_values: vec![PowerForecastValue::expected(2000.0, q())],
+            }],
+            is_interruptible: false,
+            max_pause_before: None,
+            abnormal_condition_only: false,
+        }],
+    };
+    let profile =
+        |end: &str, containers: Vec<ppbc::PowerSequenceContainer>| ppbc::PowerProfileDefinition {
+            message_id: id("m1"),
+            id: id("p1"),
+            start_time: now(),
+            end_time: at(end),
+            power_sequence_containers: containers,
+        };
+
+    // Three hours of work in a two-hour window: every container fits on its own.
+    let report = alone(profile(
+        "2024-01-01T14:00:00Z",
+        vec![container("c1"), container("c2"), container("c3")],
+    ));
+    assert!(
+        report.contains(rules::PPBC_WINDOW_TOO_SHORT),
+        "three one-hour containers do not fit two hours: {report}"
+    );
+
+    // Four hours of window, and the same three containers fit with room to spare.
+    let report = alone(profile(
+        "2024-01-01T16:00:00Z",
+        vec![container("c1"), container("c2"), container("c3")],
+    ));
+    assert!(
+        !report.contains(rules::PPBC_WINDOW_TOO_SHORT),
+        "three hours of work fits a four-hour window: {report}"
+    );
+
+    // And `model::schedule` agrees with the validator about both, which is the point of
+    // having the rule read the same way the scheduler does.
+    let chosen = [
+        (id("c1"), id("sq")),
+        (id("c2"), id("sq")),
+        (id("c3"), id("sq")),
+    ];
+    let containers = vec![container("c1"), container("c2"), container("c3")];
+    assert!(!s2_kit::model::is_schedulable(
+        &profile("2024-01-01T14:00:00Z", containers.clone()),
+        &chosen
+    ));
+    assert!(s2_kit::model::is_schedulable(
+        &profile("2024-01-01T16:00:00Z", containers),
+        &chosen
+    ));
 }

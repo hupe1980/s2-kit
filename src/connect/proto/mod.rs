@@ -168,8 +168,14 @@ impl NodeIdAlias {
 
 impl<'de> Deserialize<'de> for NodeIdAlias {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = <&str as Deserialize>::deserialize(deserializer)?;
-        Self::parse(raw).map_err(serde::de::Error::custom)
+        // `String`, not `&str`: a borrowed string cannot come out of a `serde_json::Value`
+        // at all, so a `&str` here refuses every body that anything re-parsed — a proxy, a
+        // middleware, a test fixture — with "expected a borrowed string", which reads as a
+        // malformed alias rather than as a deserializer that cannot borrow. The same trap
+        // `codec::peek` documents for `message_type`, on a field an unauthenticated peer
+        // chooses.
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -797,6 +803,25 @@ mod tests {
 
     fn token() -> PairingToken {
         PairingToken::parse("A1b2C3", TokenKind::Static).expect("a legal token")
+    }
+
+    #[test]
+    fn an_alias_is_validated_however_the_body_was_parsed() {
+        // `requestPairing` needs no bearer, so `nodeIdAlias` is a string an
+        // unauthenticated peer chooses: the validation has to be on the way *in*.
+        assert!(serde_json::from_str::<NodeIdAlias>(r#""evse7""#).is_ok());
+        assert!(serde_json::from_str::<NodeIdAlias>(r#""evse 7""#).is_err());
+        assert!(serde_json::from_str::<NodeIdAlias>(r#""""#).is_err());
+
+        // And the deserializer must not require a *borrowed* string. A `&str` here works
+        // straight off the wire and then refuses every body something re-parsed — a
+        // proxy, a middleware, a fixture — with "expected a borrowed string", which reads
+        // as a malformed alias rather than as a deserializer that cannot borrow.
+        assert!(serde_json::from_str::<NodeIdAlias>(r#""evse\u0037""#).is_ok());
+        assert_eq!(
+            serde_json::from_value::<NodeIdAlias>(serde_json::json!("evse7")).ok(),
+            Some(NodeIdAlias("evse7".into()))
+        );
     }
 
     #[test]

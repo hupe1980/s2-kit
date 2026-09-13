@@ -293,6 +293,18 @@ impl TokenStore {
         if self.tokens.iter().any(|h| h.token.verify(&token)) {
             return;
         }
+        // Retire grants that can no longer be confirmed, *before* making room. A grant
+        // past [`PENDING_TOKEN_LIFETIME`] can never be activated — `confirm` refuses it —
+        // so it is a slot holding nothing, and the list is only four long. Without this,
+        // four `initiateSession` calls whose replies never reached the client would push
+        // the token that actually works off the end, and the pairing would be dead while
+        // every party still believed in it. That is the exact failure `S2C §Recovery`
+        // keeps a list to avoid.
+        self.tokens.retain(|held| {
+            held.granted.is_none_or(|granted| {
+                now.saturating_duration_since(granted) <= PENDING_TOKEN_LIFETIME
+            })
+        });
         self.tokens.insert(
             0,
             Held {
@@ -852,6 +864,38 @@ mod tests {
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_unix(1_700_000_000 + secs, 0)
+    }
+
+    #[test]
+    fn a_grant_nobody_confirmed_never_evicts_the_token_that_works() {
+        // Four `initiateSession` calls whose replies never reached the client each add a
+        // pending grant. With a four-deep list and no expiry, the fourth pushes the token
+        // that is actually in force off the end — and the pairing is dead while both
+        // parties still believe in it. A grant past `PENDING_TOKEN_LIFETIME` can never be
+        // confirmed, so it is a slot holding nothing and goes first.
+        let live = AccessToken::from_entropy(&[9u8; 32]).expect("32 bytes");
+        let mut store = TokenStore::new(live.clone());
+        for i in 0..6u8 {
+            let granted = AccessToken::from_entropy(&[i; 32]).expect("32 bytes");
+            // Each attempt a minute after the last: every earlier grant is long dead.
+            store.add(granted, t(i64::from(i) * 60));
+        }
+        assert!(
+            store.accepts(&live),
+            "the token the client is still holding must keep working"
+        );
+        assert_eq!(store.len(), 2, "one live token and the newest grant");
+
+        // Grants that are still inside their window are *not* dropped: two initiations a
+        // second apart are a client retrying, not a client leaking.
+        let live = AccessToken::from_entropy(&[9u8; 32]).expect("32 bytes");
+        let mut store = TokenStore::new(live.clone());
+        for i in 0..3u8 {
+            let granted = AccessToken::from_entropy(&[i; 32]).expect("32 bytes");
+            store.add(granted, t(i64::from(i)));
+        }
+        assert_eq!(store.len(), 4);
+        assert!(store.accepts(&live));
     }
 
     fn ids() -> (NodeId, NodeId) {

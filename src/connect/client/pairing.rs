@@ -16,6 +16,10 @@ use super::http::{Error, Http};
 const REQUEST_PAIRING: &str = "requestPairing";
 const REQUEST_CONNECTION_DETAILS: &str = "requestConnectionDetails";
 const POST_CONNECTION_DETAILS: &str = "postConnectionDetails";
+// The path, which is what goes on the wire. `S2C-OAS pairing` gives this operation the
+// `operationId` `confirmPairing`, which every other operation in the file does not do —
+// so a generated client calls it `confirm_pairing` and nobody searching for
+// `finalizePairing` finds it (erratum E28).
 const FINALIZE_PAIRING: &str = "finalizePairing";
 
 /// What a completed pairing leaves you holding.
@@ -186,6 +190,44 @@ impl Pairing {
             .post("requestPairing", REQUEST_PAIRING, None, &body)
             .await?;
 
+        // From here on the server is holding an attempt for us, and every failure below is
+        // one it would otherwise sit on for the whole fifteen-second budget — refusing
+        // every retry with `503`, because the rate limit is one attempt per node per
+        // second and an attempt in flight occupies the slot. `finalizePairing { success:
+        // false }` is what releases it, and `S2C` calls that a legitimate outcome rather
+        // than an error path. So the rest of the attempt runs in a closure whose failure
+        // is reported *and* cleaned up.
+        let bearer_of = |machine: &PairingClient| {
+            machine
+                .attempt_id()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_default()
+        };
+        match self.finish(&mut machine, accepted, now, own_details).await {
+            Ok(paired) => Ok(paired),
+            Err(e) => {
+                let bearer = bearer_of(&machine);
+                if !bearer.is_empty() {
+                    crate::trace::event!(
+                        info,
+                        error = %e,
+                        "releasing the pairing attempt after a failure"
+                    );
+                    self.abandon(&bearer).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Steps 4 to 8, once `requestPairing` has been answered.
+    async fn finish(
+        &self,
+        machine: &mut PairingClient,
+        accepted: crate::connect::proto::PairingAccepted,
+        now: Timestamp,
+        own_details: Option<ConnectionDetails>,
+    ) -> Result<Paired, Error> {
         // The handshake has happened, so in a LAN we now know `F`. Supplying it here —
         // rather than at the start — is the whole reason this driver exists.
         let identity = self.http.tls().captured();

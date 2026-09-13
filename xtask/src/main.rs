@@ -1147,6 +1147,25 @@ fn interop(root: &Path) -> Result<()> {
     let work = root.join("target/interop");
     std::fs::create_dir_all(&work)?;
 
+    // The copy lives under `target/`, so cargo walks up and finds *this* repository's
+    // `.cargo/config.toml` when it builds there. An alias is harmless; a `[build]` or
+    // `[target]` section would silently apply this crate's flags to somebody else's
+    // source, and the result would look like an interoperability failure.
+    let config = root.join(".cargo/config.toml");
+    if config.is_file() {
+        let text = std::fs::read_to_string(&config)?;
+        for section in ["[build]", "[target"] {
+            if text.contains(section) {
+                bail!(
+                    "{} contains a {section} section, which would leak into the peer \
+                     builds under target/interop; build the peers outside the repository \
+                     or move that setting",
+                    config.display()
+                );
+            }
+        }
+    }
+
     let seconds: u64 = std::env::var("INTEROP_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1261,6 +1280,12 @@ fn build_peer(reference: &Path, work: &Path, peer: &Peer) -> Result<PathBuf> {
     let status = std::process::Command::new("cargo")
         .current_dir(&target)
         .args(["build", "--release"])
+        // A peer's lint hygiene is not this crate's business, and CI exports
+        // `RUSTFLAGS: -D warnings` for its own code. Inheriting that into somebody else's
+        // source fails the interop job for an unused import — which says nothing about
+        // interoperability and cannot be fixed here. `--cap-lints allow` is the same
+        // treatment cargo already gives every registry dependency.
+        .env("RUSTFLAGS", "--cap-lints allow")
         .status()
         .with_context(|| format!("building {}", peer.name))?;
     if !status.success() {

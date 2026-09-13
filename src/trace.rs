@@ -24,24 +24,52 @@ macro_rules! event {
     ($level:ident, $($rest:tt)*) => {{
         #[cfg(feature = "tracing")]
         ::tracing::$level!($($rest)*);
-        // Without the feature, the arguments are still type-checked against nothing —
-        // which is the point: a call site that would not compile with `tracing` on must
-        // not compile with it off either.
         #[cfg(not(feature = "tracing"))]
-        {
-            $crate::trace::ignore(format_args!(""));
-        }
+        $crate::trace::never_called(|| {
+            $crate::trace::name_only!($($rest)*);
+        });
     }};
+}
+
+/// Compiles a log call's arguments without running them.
+///
+/// Takes the closure and drops it. The body is type-checked, so a field naming something
+/// that does not exist is still a compile error and a variable mentioned only in a log
+/// call still counts as used — but nothing is called, so nothing is evaluated. That second
+/// half matters: `diagnostic = ?report.diagnostic_label()` allocates a `String`, and a
+/// build with `tracing` off must pay for it exactly what it asked to pay, which is nothing.
+#[cfg(not(feature = "tracing"))]
+#[inline(always)]
+#[allow(dead_code, reason = "no call sites in a build with no driver feature")]
+pub(crate) fn never_called(_: impl FnOnce()) {}
+
+/// Names each value of a `tracing` field list, in the three spellings `tracing` accepts —
+/// `field = %display`, `field = ?debug` and `field = value` — followed by the message.
+///
+/// Only reachable from [`event!`], and only inside the closure above.
+#[allow(
+    unused_macros,
+    reason = "no call sites in a build with no driver feature"
+)]
+macro_rules! name_only {
+    () => {};
+    ($message:literal $(,)?) => {};
+    ($field:ident = % $value:expr, $($rest:tt)*) => {
+        let _ = &$value;
+        $crate::trace::name_only!($($rest)*);
+    };
+    ($field:ident = ? $value:expr, $($rest:tt)*) => {
+        let _ = &$value;
+        $crate::trace::name_only!($($rest)*);
+    };
+    ($field:ident = $value:expr, $($rest:tt)*) => {
+        let _ = &$value;
+        $crate::trace::name_only!($($rest)*);
+    };
 }
 
 #[allow(
     unused_imports,
     reason = "no call sites in a build with no driver feature"
 )]
-pub(crate) use event;
-
-/// Swallows the arguments when the feature is off.
-#[cfg(not(feature = "tracing"))]
-#[inline(always)]
-#[allow(dead_code, reason = "no call sites in a build with no driver feature")]
-pub(crate) fn ignore(_: core::fmt::Arguments<'_>) {}
+pub(crate) use {event, name_only};

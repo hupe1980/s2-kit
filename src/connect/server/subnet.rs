@@ -46,9 +46,15 @@ impl LocalSubnets {
     /// When the interfaces cannot be enumerated at all. A host in that state cannot make
     /// the check the specification requires, and the caller must decide whether to serve
     /// the LAN-only routes without it — this crate will not decide that quietly.
+    ///
+    /// Loopback interfaces are left out: behind a local reverse proxy that terminates TLS,
+    /// *every* request arrives from `127.0.0.1`, and counting that as the same subnet would
+    /// serve the unauthenticated LAN routes to the internet. A host that really serves
+    /// clients on loopback says so with [`allowing_loopback`](Self::allowing_loopback).
     pub fn detect() -> std::io::Result<Self> {
         let nets = if_addrs::get_if_addrs()?
             .into_iter()
+            .filter(|iface| !iface.is_loopback())
             .map(|iface| match iface.addr {
                 if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), v4.prefixlen),
                 if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen),
@@ -65,13 +71,21 @@ impl LocalSubnets {
         }
     }
 
+    /// Also admit peers on loopback — a test, or a host whose clients really are local
+    /// processes. Not for a host behind a reverse proxy on the same machine.
+    #[must_use]
+    pub fn allowing_loopback(mut self) -> Self {
+        self.nets
+            .push((IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 8));
+        self.nets
+            .push((IpAddr::V6(core::net::Ipv6Addr::LOCALHOST), 128));
+        self
+    }
+
     /// Whether a peer is on one of them.
     #[must_use]
     pub fn contains(&self, peer: IpAddr) -> bool {
         let peer = unmap(peer);
-        if peer.is_loopback() {
-            return true;
-        }
         self.nets
             .iter()
             .any(|(local, prefix)| same_prefix(unmap(*local), peer, *prefix))
@@ -210,12 +224,19 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_itself_is_always_local() {
+    fn loopback_is_local_only_when_the_host_says_so() {
+        // Behind a reverse proxy on the same machine every request arrives from
+        // 127.0.0.1, so "loopback is always local" opened the unauthenticated LAN routes
+        // to whatever the proxy forwards — the internet, typically.
         let nets = LocalSubnets::from_prefixes([]);
+        assert!(!nets.contains(v4("127.0.0.1")));
+        assert!(!nets.contains(v6("::1")));
+
+        let nets = nets.allowing_loopback();
         assert!(nets.contains(v4("127.0.0.1")));
         assert!(nets.contains(v6("::1")));
         assert!(nets.contains(v6("::ffff:127.0.0.1")));
-        // And with no interfaces at all, nothing else is.
+        // And nothing else comes with it.
         assert!(!nets.contains(v4("192.168.1.1")));
     }
 
@@ -232,6 +253,7 @@ mod tests {
         let Ok(nets) = LocalSubnets::detect() else {
             return; // A sandbox with no interfaces; nothing to assert.
         };
-        assert!(nets.contains(v4("127.0.0.1")));
+        // The loopback interface is left out of what was detected.
+        assert!(!nets.contains(v4("127.0.0.1")));
     }
 }

@@ -109,7 +109,27 @@ impl Session {
     /// A `401` on the first is not a failure: the store may hold a token the server has
     /// already retired, so this works down the list the way `S2C §Recovery` prescribes,
     /// and only gives up when every one has been refused.
+    ///
+    /// Every other failure leaves this session ready for the next attempt — after
+    /// [`backoff`](Self::backoff) — with whatever tokens survived, because
+    /// `S2C §Reconnection strategy` says the client "**must** try to reconnect". A
+    /// `NoLongerPaired` is the exception: the pairing is gone, the tokens are cleared, and
+    /// only a new pairing helps.
     pub async fn initiate(&mut self, now: Timestamp) -> Result<SessionCredentials, Error> {
+        let result = self.attempt(now).await;
+        if let Err(e) = &result
+            && !matches!(
+                e,
+                Error::Protocol(crate::connect::proto::ConnectError::SessionRefused(refused))
+                    if refused.error_message == crate::connect::proto::SessionErrorMessage::NoLongerPaired
+            )
+        {
+            self.machine.restart();
+        }
+        result
+    }
+
+    async fn attempt(&mut self, now: Timestamp) -> Result<SessionCredentials, Error> {
         loop {
             let (bearer, body) = self.machine.initiate()?;
             let grant: SessionGrant = match self
@@ -132,6 +152,30 @@ impl Session {
                     );
                     self.machine.unauthorized()?;
                     continue;
+                }
+                Err(Error::Http {
+                    status,
+                    detail: Some(detail),
+                    ..
+                }) if status.0 == 400 => {
+                    // A named refusal. `NoLongerPaired` means "Do not retry": forget.
+                    if let Ok(refused) =
+                        serde_json::from_str::<crate::connect::proto::SessionRefused>(&detail)
+                    {
+                        if refused.error_message
+                            == crate::connect::proto::SessionErrorMessage::NoLongerPaired
+                        {
+                            let _ = self.machine.unpaired();
+                        }
+                        return Err(Error::Protocol(
+                            crate::connect::proto::ConnectError::SessionRefused(refused),
+                        ));
+                    }
+                    return Err(Error::Http {
+                        operation: "initiateSession",
+                        status,
+                        detail: Some(detail),
+                    });
                 }
                 Err(e) => return Err(e),
             };

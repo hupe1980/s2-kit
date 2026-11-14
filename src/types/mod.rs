@@ -179,6 +179,9 @@ pub enum WireProfile {
 }
 
 impl WireProfile {
+    /// Every profile this crate speaks, most preferred first — the default offer.
+    pub const ALL: [Self; 2] = [Self::V1_0_0, Self::V0_0_2Beta];
+
     /// The version string this crate offers for the profile **in an S2 JSON handshake**.
     ///
     /// No `v`, which is what every deployed implementation negotiates;

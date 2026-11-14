@@ -28,10 +28,10 @@ use std::sync::Arc;
 use s2_kit::connect::client::{Pairing, Session};
 use s2_kit::connect::proto::*;
 use s2_kit::connect::server::{
-    Endpoint, LocalSubnets, Memory, PairingService, SessionService, lan_router, serve,
-    websocket_router,
+    CommunicationServer, Endpoint, LocalSubnets, Memory, PairingService, SessionService,
+    lan_router, serve, websocket_router,
 };
-use s2_kit::connect::tls::SelfSignedEndpoint;
+use s2_kit::connect::tls::{Fingerprint, SelfSignedEndpoint};
 use s2_kit::io::{Driver, WebSocket};
 use s2_kit::prelude::{CemConfig, CemEvent, CemSession, MessageKind, RmConfig, RmEvent, RmSession};
 use s2_kit::types::{Timestamp, WireProfile};
@@ -66,7 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let base = format!("https://localhost:{port}/v1/");
+    // Unversioned, as DNS-SD would advertise it: the client reads the version index at
+    // this URL first (`["v1"]`) and joins its operations below `v1/`.
+    let base = format!("https://localhost:{port}/");
 
     let store = Memory::new();
     let hub = describe("cem-1", Role::Cem, "Acme", "Home hub");
@@ -74,15 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     store.add_node(hub, Some(NodeIdAlias::parse("hub7").unwrap()));
 
     // Both nodes are in the LAN, so the CEM is the communication server — it is the side
-    // that hands out connection details.
+    // that hands out connection details. Where to connect, and which CA it uses; the access
+    // token is minted fresh for every client that pairs.
     let pairing = Arc::new(
         PairingService::lan(store.clone(), lan("Acme home hub"), identity.leaf)
-            .with_connection_details(ConnectionDetails {
+            .as_communication_server(CommunicationServer {
                 initiate_session_url: base.clone(),
-                access_token: AccessToken::from_entropy(&[7u8; 32])?,
-                certificate_fingerprint: [("SHA256".into(), identity.leaf.to_hex())]
-                    .into_iter()
-                    .collect(),
+                ca: Fingerprint::of(&identity.ca),
             }),
     );
     let session_service = Arc::new(SessionService::new(
@@ -93,13 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/nodes` — the unauthenticated operations, behind the same-subnet check that is
     // their only access control. A WAN endpoint would use `router` and answer 404 there.
     let endpoint = Endpoint::new(pairing, session_service);
-    let app = lan_router(endpoint.clone(), LocalSubnets::detect()?).merge(websocket_router(
+    // This demo runs on loopback, so loopback counts as the LAN here; a real hub leaves it
+    // out (a reverse proxy on the same machine would otherwise open the LAN routes to
+    // everyone).
+    let subnets = LocalSubnets::detect()?.allowing_loopback();
+    let app = lan_router(endpoint.clone(), subnets).merge(websocket_router(
         endpoint,
         "/s2",
-        |node, socket| async move {
-            // One `CemSession` per accepted connection. `node` says which paired resource
-            // this is; a real hub would look up what it knows about that device.
-            println!("hub accepted socket  from {node}");
+        |pairing, socket| async move {
+            // One `CemSession` per accepted connection. `pairing.remote` says which paired
+            // resource this is; a real hub would look up what it knows about that device.
+            println!("hub accepted socket  from {}", pairing.remote);
             let mut cem = CemSession::new(CemConfig::default().pre_negotiated(WireProfile::V1_0_0));
             cem.open(Timestamp::now());
             let _ = Driver::new(socket)
@@ -145,8 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paired.pairing.communication_server
     );
     println!(
-        "  pinned CA           {} bytes of certificate",
-        paired.identity.as_ref().map_or(0, |i| i.root.len())
+        "  pinned CA           {}",
+        paired
+            .pin()
+            .map_or_else(|| "none".into(), |pin| pin.to_hex())
     );
     println!(
         "  TLS from here on    authenticates: {}\n",

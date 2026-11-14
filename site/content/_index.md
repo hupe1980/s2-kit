@@ -6,9 +6,9 @@ template = "index.html"
 
 ## What S2 is
 
-**S2** — formally **EN 50491-12-2**, becoming IEC 63402-2 — is the European standard for
-communicating *energy flexibility* between a **Customer Energy Manager** (CEM) and a
-**Resource Manager** (RM). A battery, an EV charger, a heat pump or a PV inverter
+**S2** — formally **EN 50491-12-2**, internationally IEC 63402-2-2 — is the European
+standard for communicating *energy flexibility* between a **Customer Energy Manager**
+(CEM) and a **Resource Manager** (RM). A battery, an EV charger, a heat pump or a PV inverter
 describes **how** it can behave; the energy manager decides **why** it should.
 
 The standard's own image is a menu: the resource writes it, the manager orders from it,
@@ -85,9 +85,10 @@ timer that blocks a transition are ordinary unit tests that run in microseconds.
 
 ### S2 Connect, end to end
 
-Discovery over DNS-SD, the mutual HMAC challenge–response with its certificate binding,
-the per-node rate limit, the two-phase token commit, and an `axum` endpoint — through to
-the WebSocket the communication token opens, over a real TLS connection.
+Discovery over DNS-SD, API version discovery, the mutual HMAC challenge–response bound
+to the certificate, a fresh access token per pairing, the two-phase token commit, and an
+`axum` endpoint — through to the WebSocket the communication token opens and unpairing
+closes, over a real TLS connection.
 
 </div>
 <div>

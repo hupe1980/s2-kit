@@ -4,14 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Once a week, so an advisory in a dependency surfaces before a release does.
-    - cron: "17 4 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUST_BACKTRACE: 1
+  # Where `xtask` finds the upstream S2 repositories; jobs that need them clone them here.
+  S2_REFERENCE: ${{ github.workspace }}/../s2-reference
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -153,6 +152,21 @@ jobs:
           done
           echo "std,uuid,tls-ring -> no TLS stack"
 
+  # Principle VIII: a break is said out loud. Before 1.0 a minor bump may break the API,
+  # so this fails only on a break the version number does not announce — the CHANGELOG
+  # entry listing old → new spelling is the reviewer's half. Both the default and the full
+  # feature set, because a break behind a feature is still a break.
+  semver:
+    name: semver against crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo semver-checks --default-features
+      - run: cargo semver-checks --all-features
+
   # Features are not a matrix of two: fifteen of them are 32 768 combinations, and the
   # ones that fail to compile are always the ones nobody tried. `cargo hack` tries them.
   features:
@@ -177,11 +191,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # All three repositories: `vendor-specs` needs the schemas, and
       # `gen-model-reference` and `check-docs` need the standard's own field documentation.
+      # Outside the checkout, so the staleness check below needs no exclusion.
       - name: Clone the specifications
         run: |
-          git clone --quiet https://github.com/flexiblepower/s2-json specs/s2-json
-          git clone --quiet https://github.com/flexiblepower/s2-connect specs/s2-connect
-          git clone --quiet https://github.com/flexiblepower/s2-documentation specs/s2-documentation
+          git clone --quiet https://github.com/flexiblepower/s2-json "$S2_REFERENCE/s2-json"
+          git clone --quiet https://github.com/flexiblepower/s2-connect "$S2_REFERENCE/s2-connect"
+          git clone --quiet https://github.com/flexiblepower/s2-documentation "$S2_REFERENCE/s2-documentation"
+          # s2-json is read at its release tag by `vendor-specs`; the documentation has no
+          # tags, so it is pinned here. Moving the pin is a reviewed change, not a surprise
+          # on somebody else's merge. Bump it with `git rev-parse origin/main`.
+          git -C "$S2_REFERENCE/s2-documentation" checkout --quiet c5d17e4530f028860da984e8540f577138a8bc9c
       - run: cargo xtask vendor-specs
       - run: cargo xtask all
       # By name as well: `all` skips these two when the specs are absent, so only running
@@ -190,7 +209,7 @@ jobs:
       - run: cargo xtask check-docs
       - name: Fail if anything is stale
         run: |
-          if ! git diff --exit-code -- . ':!specs'; then
+          if ! git diff --exit-code; then
             echo "::error::Generated or vendored files are out of date."
             echo "::error::Run 'cargo xtask vendor-specs && cargo xtask all' and commit."
             exit 1
@@ -218,7 +237,7 @@ jobs:
         run: |
           git clone --quiet --depth 1 \
             https://github.com/flexiblepower/s2-example-implementations \
-            specs/_reference/s2-example-implementations
+            "$S2_REFERENCE/implementations/s2-example-implementations"
       - run: cargo xtask interop
 
   # Every example in the README and in the documentation must actually run; an example

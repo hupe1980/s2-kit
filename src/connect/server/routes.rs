@@ -242,15 +242,27 @@ impl Endpoint {
     }
 }
 
-/// The router for an S2 Connect endpoint, mounted at `/v1`.
+/// The API versions this endpoint serves, newest first: what `GET /` answers.
+pub const API_VERSIONS: &[&str] = &["v1"];
+
+/// The router for an S2 Connect endpoint: the version index at `/`, the operations
+/// under `/v1`.
 ///
-/// `S2C §Formal specification and versioning` puts every operation under a version
-/// segment, and the OpenAPI's `servers` entry is `/v1`. Mounting it anywhere else makes
-/// an endpoint no client can talk to.
+/// `S2C §Versioning of OpenAPI files`: "The server **must** always … serve an index (e.g.
+/// `https://hostname.local/pairing/`) which returns a JSON array containing the versions
+/// of the API that it supports (e.g. `["v1", "v2"]`)." A client "**must** always first
+/// determine which version of the API it will use", and URLs exchanged between endpoints
+/// carry no version — so without the index no conforming client gets past its first
+/// request. Mount this router where the base URL you advertise points.
 pub fn router(endpoint: Endpoint) -> axum::Router {
     axum::Router::new()
+        .route("/", get(versions))
         .nest("/v1", authenticated_routes(endpoint))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+}
+
+async fn versions() -> Response {
+    (StatusCode::OK, Json(API_VERSIONS)).into_response()
 }
 
 /// The largest request body any S2 Connect operation will read.
@@ -296,6 +308,7 @@ pub fn lan_router(endpoint: Endpoint, subnets: LocalSubnets) -> axum::Router {
         ));
 
     axum::Router::new()
+        .route("/", get(versions))
         .nest("/v1", authenticated_routes(endpoint).merge(lan_only))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
@@ -325,7 +338,7 @@ fn authenticated_routes(endpoint: Endpoint) -> axum::Router {
 
 async fn request_pairing(
     State(endpoint): State<Endpoint>,
-    Json(request): Json<PairingRequest>,
+    PairingBody(request): PairingBody<PairingRequest>,
 ) -> Response {
     let mut nonce = [0u8; 32];
     let mut attempt = [0u8; 24];
@@ -363,7 +376,7 @@ async fn request_pairing(
 async fn request_connection_details(
     State(endpoint): State<Endpoint>,
     bearer: Bearer,
-    Json(request): Json<ConnectionDetailsRequest>,
+    PairingBody(request): PairingBody<ConnectionDetailsRequest>,
 ) -> Response {
     let now = (endpoint.clock)();
     let Some(node) = endpoint.attempt_node(&bearer.0, now) else {
@@ -392,7 +405,7 @@ async fn request_connection_details(
 async fn post_connection_details(
     State(endpoint): State<Endpoint>,
     bearer: Bearer,
-    Json(request): Json<ConnectionDetailsPost>,
+    PairingBody(request): PairingBody<ConnectionDetailsPost>,
 ) -> Response {
     let now = (endpoint.clock)();
     let Some(node) = endpoint.attempt_node(&bearer.0, now) else {
@@ -422,7 +435,7 @@ async fn post_connection_details(
 async fn finalize_pairing(
     State(endpoint): State<Endpoint>,
     bearer: Bearer,
-    Json(body): Json<FinalizePairing>,
+    PairingBody(body): PairingBody<FinalizePairing>,
 ) -> Response {
     let now = (endpoint.clock)();
     let Some(node) = endpoint.attempt_node(&bearer.0, now) else {
@@ -436,7 +449,10 @@ async fn finalize_pairing(
     // without success) the identifier can be discarded."
     endpoint.forget(&bearer.0);
     match result {
-        Ok(()) => {
+        Ok(finalized) => {
+            for key in &finalized.displaced {
+                endpoint.session.end_sessions(*key);
+            }
             crate::trace::event!(
                 info,
                 node = %node,
@@ -476,7 +492,7 @@ async fn get_nodes(State(endpoint): State<Endpoint>) -> Response {
 
 async fn prepare_pairing(
     State(endpoint): State<Endpoint>,
-    Json(body): Json<crate::connect::proto::PreparePairing>,
+    PairingBody(body): PairingBody<crate::connect::proto::PreparePairing>,
 ) -> Response {
     // "204: Notification received (also used when provided serverNodeId is not known)" —
     // so an unknown node is not an error, and telling the caller which node identifiers
@@ -489,7 +505,7 @@ async fn prepare_pairing(
 
 async fn cancel_prepare_pairing(
     State(endpoint): State<Endpoint>,
-    Json(body): Json<crate::connect::proto::CancelPreparePairing>,
+    PairingBody(body): PairingBody<crate::connect::proto::CancelPreparePairing>,
 ) -> Response {
     if let Some(handler) = &endpoint.on_prepare {
         handler(PrepareSignal::Cancel(body));
@@ -499,14 +515,18 @@ async fn cancel_prepare_pairing(
 
 /// `POST /v1/waitForPairing` — held open until there is something to say.
 ///
-/// Always `200`, with a list that may be empty: "nothing yet, ask again" is the normal
-/// answer and must not look like a failure, or a client that is working perfectly spends
-/// its life backing off.
+/// `200` with at least one instruction, or `204` when the hold ran out with nothing to
+/// say: `S2C-OAS pairing/waitForPairing` gives the `200` list `minItems: 1`, and
+/// `S2C §Long-polling` — "When the server wants the client to immediately do a new
+/// request, it responds with status code 204."
 async fn wait_for_pairing(
     State(endpoint): State<Endpoint>,
-    Json(nodes): Json<Vec<crate::connect::proto::WaitForPairing>>,
+    PairingBody(nodes): PairingBody<Vec<crate::connect::proto::WaitForPairing>>,
 ) -> Response {
     let instructions = endpoint.long_poll.poll(&nodes).await;
+    if instructions.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
     (StatusCode::OK, Json(instructions)).into_response()
 }
 
@@ -517,7 +537,7 @@ async fn wait_for_pairing(
 async fn initiate_session(
     State(endpoint): State<Endpoint>,
     bearer: Bearer,
-    Json(request): Json<crate::connect::proto::SessionRequest>,
+    SessionBody(request): SessionBody<crate::connect::proto::SessionRequest>,
 ) -> Response {
     let mut entropy = [0u8; 32];
     if fill_random(&mut entropy).is_err() {
@@ -542,8 +562,8 @@ async fn confirm_access_token(State(endpoint): State<Endpoint>, bearer: Bearer) 
     let token = AccessToken::new(bearer.0);
     let now = (endpoint.clock)();
     match endpoint.session.confirm_access_token(&token, &entropy, now) {
-        Ok((remote, details)) => {
-            crate::trace::event!(info, node = %remote, "issued a communication token");
+        Ok((key, details)) => {
+            crate::trace::event!(info, node = %key.remote, "issued a communication token");
             (StatusCode::OK, Json(details)).into_response()
         }
         // A grant that was not confirmed inside `PENDING_TOKEN_LIFETIME` reads the same
@@ -556,7 +576,7 @@ async fn confirm_access_token(State(endpoint): State<Endpoint>, bearer: Bearer) 
 async fn unpair(
     State(endpoint): State<Endpoint>,
     bearer: Bearer,
-    Json(request): Json<crate::connect::proto::UnpairRequest>,
+    SessionBody(request): SessionBody<crate::connect::proto::UnpairRequest>,
 ) -> Response {
     let token = AccessToken::new(bearer.0);
     match endpoint.session.unpair(&token, &request) {
@@ -604,6 +624,74 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Bearer {
     }
 }
 
+/// A JSON body of the pairing API, refused as `400 ParsingError` when it does not parse.
+///
+/// `S2C §1. Request pairing`: "Is the request properly formatted …? | `ParsingError`".
+/// axum's own `Json` answers `415`/`422` with a plain-text body, which no S2 Connect
+/// client is written to read.
+pub(super) struct PairingBody<T>(pub T);
+
+/// The same, for the session-initiation API and its `SessionRefused` body.
+pub(super) struct SessionBody<T>(pub T);
+
+fn parsing_error_pairing() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(crate::connect::proto::PairingRefused {
+            error_message: crate::connect::proto::PairingErrorMessage::ParsingError,
+            additional_info: None,
+        }),
+    )
+        .into_response()
+}
+
+fn parsing_error_session() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(crate::connect::proto::SessionRefused {
+            error_message: crate::connect::proto::SessionErrorMessage::ParsingError,
+            additional_info: None,
+        }),
+    )
+        .into_response()
+}
+
+impl<S, T> axum::extract::FromRequest<S> for PairingBody<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(rejection.into_response())
+            }
+            Err(_) => Err(parsing_error_pairing()),
+        }
+    }
+}
+
+impl<S, T> axum::extract::FromRequest<S> for SessionBody<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(rejection.into_response())
+            }
+            Err(_) => Err(parsing_error_session()),
+        }
+    }
+}
+
 /// The mapping the specification's recovery logic depends on.
 fn pairing_error(error: ConnectError) -> Response {
     match error {
@@ -633,10 +721,7 @@ fn session_error(error: ConnectError) -> Response {
     }
 }
 
-fn fill_random(buffer: &mut [u8]) -> Result<(), rand::rngs::SysError> {
-    use rand::TryRng as _;
-    rand::rngs::SysRng.try_fill_bytes(buffer)
-}
+use super::fill_random;
 
 #[cfg(test)]
 mod tests {
@@ -808,6 +893,72 @@ mod subnet_wiring {
         // Failing closed is the only safe reading: the alternative is serving the
         // unauthenticated routes to the internet because of a missing builder call.
         assert_eq!(get(app, None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    async fn body(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a body");
+        String::from_utf8(bytes.to_vec()).expect("UTF-8")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_poll_with_nothing_to_say_is_no_content() {
+        // `S2C-OAS pairing/waitForPairing`: `200` carries at least one item; a hold that
+        // ran out is `204`, "No action for the client, try again."
+        let subnets =
+            LocalSubnets::from_prefixes([("192.168.1.10".parse().expect("an address"), 24)]);
+        let app = lan_router(endpoint(), subnets);
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/waitForPairing")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"[{"clientNodeId":"rm-1"}]"#))
+            .expect("a request");
+        let peer: std::net::SocketAddr = "192.168.1.50:9000".parse().expect("an address");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let response = app.oneshot(request).await.expect("an answer");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn the_version_index_answers_at_the_root() {
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("a request");
+        let response = router(endpoint())
+            .oneshot(request)
+            .await
+            .expect("an answer");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, r#"["v1"]"#);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_does_not_parse_is_a_named_parsing_error() {
+        // Not axum's `422` with a plain-text body: `S2C §1` names this outcome.
+        for (path, field) in [
+            ("/v1/requestPairing", "PairingResponseErrorMessage"),
+            ("/v1/initiateSession", "CommunicationDetailsErrorMessage"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer x")
+                .body(axum::body::Body::from("{\"not\": \"a request\"}"))
+                .expect("a request");
+            let response = router(endpoint())
+                .oneshot(request)
+                .await
+                .expect("an answer");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let text = body(response).await;
+            assert!(text.contains("ParsingError"), "{path} ({field}): {text}");
+        }
     }
 
     #[tokio::test]

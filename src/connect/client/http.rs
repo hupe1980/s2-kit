@@ -94,6 +94,16 @@ pub enum Error {
     /// The certificate presented changed between two requests of one pairing attempt.
     #[error("the server's certificate changed during the pairing attempt")]
     IdentityChanged,
+    /// The endpoint's version index offers no API version this crate speaks.
+    #[error(
+        "the endpoint offers API versions {offered:?}, none of which this crate speaks ({supported:?})"
+    )]
+    NoCommonApiVersion {
+        /// What `GET {base}` answered.
+        offered: Vec<String>,
+        /// What this crate speaks.
+        supported: &'static [&'static str],
+    },
     /// The endpoint answered with more bytes than any S2 Connect body can legitimately be.
     #[error("{operation} answered with more than {max} bytes")]
     ResponseTooLarge {
@@ -138,16 +148,30 @@ impl Error {
 /// hostile endpoint still cannot make a constrained Resource Manager hold a gigabyte.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// The S2 Connect API versions this crate speaks, most preferred first.
+pub const API_VERSIONS: &[&str] = &["v1"];
+
 /// An HTTPS connection to one S2 Connect endpoint.
 #[derive(Debug, Clone)]
 pub(crate) struct Http {
     client: reqwest::Client,
+    /// The base URL as given: the endpoint's **unversioned** URL, whose index lists the
+    /// versions it serves.
     base: url::Url,
+    /// The versioned base every operation is joined onto, once the index has been read.
+    versioned: tokio::sync::OnceCell<url::Url>,
     tls: TlsClient,
 }
 
 impl Http {
-    /// Open a connection to `base`, which must be the endpoint's versioned base URL.
+    /// Open a connection to `base`: the endpoint's unversioned URL, as a DNS-SD
+    /// `pairingUrl` or an `initiateSessionUrl` carries it.
+    ///
+    /// `S2C §Selecting the version`: "the client **must** always first determine which
+    /// version of the API it will use" — so the first request is `GET {base}`, which a
+    /// conforming server answers with its versions (`["v1"]`). A base that already ends
+    /// in a version segment (`…/v1/`) is used as given, without the probe, for peers that
+    /// hand out versioned URLs.
     pub(crate) fn new(
         base: &str,
         policy: &TlsPolicy,
@@ -168,7 +192,54 @@ impl Http {
                 operation: "building the HTTPS client",
                 source: Box::new(e),
             })?;
-        Ok(Self { client, base, tls })
+        let versioned = tokio::sync::OnceCell::new();
+        if base
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+            .is_some_and(is_version_segment)
+        {
+            let _ = versioned.set(base.clone());
+        }
+        Ok(Self {
+            client,
+            base,
+            versioned,
+            tls,
+        })
+    }
+
+    /// The versioned base, reading the endpoint's version index the first time.
+    async fn versioned(&self) -> Result<&url::Url, Error> {
+        self.versioned
+            .get_or_try_init(|| async {
+                const OPERATION: &str = "the API version index";
+                let response = self
+                    .client
+                    .get(self.base.clone())
+                    .send()
+                    .await
+                    .map_err(|e| Error::Transport {
+                        operation: OPERATION,
+                        source: Box::new(e),
+                    })?;
+                let text = self.read(OPERATION, response).await?;
+                let offered: Vec<String> =
+                    serde_json::from_str(&text).map_err(|source| Error::Body {
+                        operation: OPERATION,
+                        source,
+                    })?;
+                let chosen = API_VERSIONS
+                    .iter()
+                    .find(|ours| offered.iter().any(|theirs| theirs == *ours))
+                    .ok_or_else(|| Error::NoCommonApiVersion {
+                        offered: offered.clone(),
+                        supported: API_VERSIONS,
+                    })?;
+                self.base
+                    .join(&alloc::format!("{chosen}/"))
+                    .map_err(|_| Error::Url(alloc::format!("{}{chosen}/", self.base)))
+            })
+            .await
     }
 
     pub(crate) fn tls(&self) -> &TlsClient {
@@ -204,7 +275,7 @@ impl Http {
         path: &str,
         bearer: Option<&str>,
     ) -> Result<R, Error> {
-        let url = self.join(path)?;
+        let url = self.join(path).await?;
         let mut request = self.client.post(url);
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
@@ -215,6 +286,35 @@ impl Http {
         })?;
         let text = self.read(operation, response).await?;
         serde_json::from_str(&text).map_err(|source| Error::Body { operation, source })
+    }
+
+    /// `POST {base}{path}` where `204 No Content` is a legitimate answer meaning "nothing".
+    ///
+    /// `waitForPairing`'s: `S2C-OAS` gives its `200` list `minItems: 1`, and a hold that
+    /// ran out is `204` — "No action for the client, try again."
+    pub(crate) async fn post_or_no_content<B: Serialize, R: DeserializeOwned>(
+        &self,
+        operation: &'static str,
+        path: &str,
+        bearer: Option<&str>,
+        body: &B,
+    ) -> Result<Option<R>, Error> {
+        let url = self.join(path).await?;
+        let mut request = self.client.post(url).json(body);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|e| Error::Transport {
+            operation,
+            source: Box::new(e),
+        })?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        let text = self.read(operation, response).await?;
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|source| Error::Body { operation, source })
     }
 
     /// `POST {base}{path}` where the answer has no body worth reading.
@@ -234,7 +334,7 @@ impl Http {
         operation: &'static str,
         path: &str,
     ) -> Result<R, Error> {
-        let url = self.join(path)?;
+        let url = self.join(path).await?;
         let response = self
             .client
             .get(url)
@@ -255,7 +355,7 @@ impl Http {
         bearer: Option<&str>,
         body: Option<&B>,
     ) -> Result<String, Error> {
-        let url = self.join(path)?;
+        let url = self.join(path).await?;
         let mut request = self.client.post(url);
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
@@ -287,11 +387,18 @@ impl Http {
         })
     }
 
-    fn join(&self, path: &str) -> Result<url::Url, Error> {
-        self.base
-            .join(path.trim_start_matches('/'))
-            .map_err(|_| Error::Url(alloc::format!("{}{path}", self.base)))
+    async fn join(&self, path: &str) -> Result<url::Url, Error> {
+        let base = self.versioned().await?;
+        base.join(path.trim_start_matches('/'))
+            .map_err(|_| Error::Url(alloc::format!("{base}{path}")))
     }
+}
+
+/// `v` followed by digits: a path segment that names an API version.
+fn is_version_segment(segment: &str) -> bool {
+    segment
+        .strip_prefix('v')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Read a response body, refusing anything past [`MAX_RESPONSE_BYTES`].
@@ -373,6 +480,15 @@ mod tests {
             normalize("https://evse.local/v1/").unwrap().as_str(),
             "https://evse.local/v1/"
         );
+    }
+
+    #[test]
+    fn a_versioned_base_is_recognised_and_an_unversioned_one_is_not() {
+        assert!(is_version_segment("v1"));
+        assert!(is_version_segment("v12"));
+        assert!(!is_version_segment("v"));
+        assert!(!is_version_segment("pairing"));
+        assert!(!is_version_segment("v1beta"));
     }
 
     #[test]

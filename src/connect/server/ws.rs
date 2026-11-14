@@ -13,13 +13,14 @@
 //! use s2_kit::prelude::*;
 //!
 //! # fn build(endpoint: Endpoint) -> axum::Router {
-//! websocket_router(endpoint, "/s2", |node, socket| async move {
-//!     // `node` is the paired peer the token belonged to: which resource this is.
+//! websocket_router(endpoint, "/s2", |pairing, socket| async move {
+//!     // `pairing.remote` is the paired peer the token belonged to: which resource this is;
+//!     // `pairing.local` is which of this endpoint's nodes it is talking to.
 //!     let mut cem = CemSession::new(CemConfig::default().pre_negotiated(WireProfile::V1_0_0));
 //!     cem.open(Timestamp::now());
 //!     let mut driver = Driver::new(socket);
 //!     let _ = driver.run(&mut cem, |_event, _session| {}).await;
-//!     let _ = node;
+//!     let _ = pairing;
 //! })
 //! # }
 //! ```
@@ -33,8 +34,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 
-use crate::connect::proto::NodeId;
-use crate::io::{Error, TextTransport};
+use crate::io::{Error, Received, TextTransport};
+
+use super::store::PairingKey;
 
 use super::routes::Endpoint;
 
@@ -49,13 +51,28 @@ use super::routes::Endpoint;
 #[derive(Debug)]
 pub struct ServerSocket {
     socket: WebSocket,
+    /// Fires when the pairing is undone; the socket then closes and reads as closed.
+    ended: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl ServerSocket {
     /// Wrap an upgraded socket.
     #[must_use]
     pub fn new(socket: WebSocket) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            ended: None,
+        }
+    }
+
+    /// Close this socket when `session` ends — when its pairing is undone.
+    ///
+    /// [`websocket_router`] does this for you; a host that upgrades sockets itself pairs
+    /// each with the [`LiveSession`](super::LiveSession) it registered.
+    #[must_use]
+    pub fn ending_with(mut self, session: &super::LiveSession) -> Self {
+        self.ended = Some(session.watch());
+        self
     }
 }
 
@@ -72,16 +89,40 @@ impl TextTransport for ServerSocket {
     #[allow(clippy::match_same_arms)]
     async fn recv_text(&mut self) -> Result<Option<String>, Error> {
         loop {
-            match self.socket.recv().await {
+            match self.recv().await? {
                 None => return Ok(None),
-                Some(Err(e)) => return Err(Error::Transport(e.to_string())),
-                Some(Ok(WsMessage::Text(text))) => return Ok(Some(text.to_string())),
-                Some(Ok(WsMessage::Close(_))) => return Ok(None),
-                // Pong frames answer our own pings; a ping is answered by axum itself.
-                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
-                Some(Ok(WsMessage::Binary(_))) => {
-                    return Err(Error::UnexpectedFrame("binary".to_string()));
+                Some(Received::Text(text)) => return Ok(Some(text)),
+                Some(Received::Alive) => {}
+            }
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Option<Received>, Error> {
+        {
+            let frame = match self.ended.as_mut() {
+                Some(ended) => {
+                    tokio::select! {
+                        frame = self.socket.recv() => Some(frame),
+                        // `S2C §Termination`: "After two nodes have unpaired, the S2
+                        // WebSocket connection MUST be terminated immediately."
+                        _ = async { ended.wait_for(|ended| *ended).await.is_ok() } => None,
+                    }
                 }
+                None => Some(self.socket.recv().await),
+            };
+            let Some(frame) = frame else {
+                let _ = self.socket.send(WsMessage::Close(None)).await;
+                return Ok(None);
+            };
+            match frame {
+                // The stream ended, or the peer said goodbye: the same thing to a session.
+                None | Some(Ok(WsMessage::Close(_))) => Ok(None),
+                Some(Err(e)) => Err(Error::Transport(e.to_string())),
+                Some(Ok(WsMessage::Text(text))) => Ok(Some(Received::Text(text.to_string()))),
+                // Pong frames answer our own pings, a ping is answered by axum itself, and
+                // both prove the peer is there.
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => Ok(Some(Received::Alive)),
+                Some(Ok(WsMessage::Binary(_))) => Err(Error::UnexpectedFrame("binary".to_string())),
             }
         }
     }
@@ -126,8 +167,10 @@ impl<H> Clone for WsState<H> {
 /// unknown one, an expired one or one already used is `401`, and the upgrade never
 /// happens.
 ///
-/// `on_session` is given the paired node the token belonged to and the upgraded socket.
-/// The S2 session *is* the WebSocket session, so when it returns the socket is closed.
+/// `on_session` is given the pairing the token belonged to and the upgraded socket. The
+/// S2 session *is* the WebSocket session, so when it returns the socket is closed — and
+/// when the pairing is undone (unpair by either side, or a re-pair that replaces it) the
+/// socket closes by itself and reads as closed, so the session ends.
 ///
 /// Mount it beside [`router`](super::router) or [`lan_router`](super::lan_router) with
 /// `Router::merge`, or serve it from another port. Separate for the same reason
@@ -135,7 +178,7 @@ impl<H> Clone for WsState<H> {
 /// *out* of serving one.
 pub fn websocket_router<H, Fut>(endpoint: Endpoint, path: &str, on_session: H) -> axum::Router
 where
-    H: Fn(NodeId, ServerSocket) -> Fut + Send + Sync + 'static,
+    H: Fn(PairingKey, ServerSocket) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     axum::Router::new()
@@ -152,11 +195,11 @@ async fn upgrade<H, Fut>(
     upgrade: WebSocketUpgrade,
 ) -> Response
 where
-    H: Fn(NodeId, ServerSocket) -> Fut + Send + Sync + 'static,
+    H: Fn(PairingKey, ServerSocket) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let now = state.endpoint.now();
-    let Some(node) = state
+    let Some(key) = state
         .endpoint
         .session()
         .authorize_connection(bearer.as_str(), now)
@@ -164,8 +207,9 @@ where
         crate::trace::event!(warn, "refused a WebSocket with an unusable token");
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    crate::trace::event!(info, node = %node, "accepted an S2 WebSocket");
+    crate::trace::event!(info, node = %key.remote, "accepted an S2 WebSocket");
     let handler = state.handler.clone();
+    let live = state.endpoint.session().register_session(key);
     // The same cap the codec applies, applied where it actually bounds memory: by the
     // time `decode` measures a frame, axum has buffered every byte of it. Without this
     // the default ceiling is axum's, not this crate's.
@@ -173,6 +217,8 @@ where
         .max_message_size(state.endpoint.max_message_bytes())
         .max_frame_size(state.endpoint.max_message_bytes())
         .on_upgrade(move |socket| async move {
-            handler(node, ServerSocket::new(socket)).await;
+            let socket = ServerSocket::new(socket).ending_with(&live);
+            handler(key, socket).await;
+            drop(live);
         })
 }

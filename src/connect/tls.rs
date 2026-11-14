@@ -30,8 +30,17 @@
 //! The HMAC binds the **leaf**; `ConnectionDetails.certificateFingerprint` pins the **CA**
 //! (erratum E19). They are a paragraph apart in the specification and
 //! named almost identically. Conflating them yields a pairing that verifies and a
-//! connection that does not, so they are different types here: [`Fingerprint`] is carried
-//! by [`CapturedIdentity`] for the first and by [`TlsPolicy::PinnedCa`] for the second.
+//! connection that does not, so they are kept apart here: [`CapturedIdentity::leaf`] is the
+//! first and [`CapturedIdentity::root`] — what [`TlsPolicy::Pinned`] holds — the second.
+//!
+//! # A pin is 32 bytes
+//!
+//! [`TlsPolicy::Pinned`] holds a fingerprint, not a certificate: the same type serves the
+//! CA captured during a LAN pairing (`S2C §4`) and the `certificateFingerprint` a 6B
+//! client posts (`S2C §8B`), and it is what a host persists beside the access token. A
+//! handshake passes when the presented leaf *is* the pinned certificate, or when a
+//! certificate in the presented chain is, and the leaf validates against it as the only
+//! trust anchor — names, validity and signatures included.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -85,23 +94,31 @@ impl Fingerprint {
         }
     }
 
+    /// A fingerprint from its 32 bytes, as stored or as read from
+    /// [`ConnectionDetails::ca_fingerprint`](super::proto::ConnectionDetails::ca_fingerprint).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// The bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    /// Lowercase hexadecimal, colon-separated, which is how every tool prints one.
+    /// Lowercase hexadecimal with no separators: the form that goes on the wire.
+    ///
+    /// `S2C §Challenge response process`: "SHA256 certificate fingerprints are encoded
+    /// into a hexadecimal string". No colons — `s2energy-connection` refuses them — and
+    /// [`parse`](Self::parse) still reads a fingerprint written either way.
     #[must_use]
     pub fn to_hex(&self) -> String {
         use core::fmt::Write as _;
-        let mut out = String::with_capacity(32 * 3 - 1);
-        for (i, b) in self.0.iter().enumerate() {
-            if i > 0 {
-                out.push(':');
-            }
+        let mut out = String::with_capacity(64);
+        for b in &self.0 {
             // Writing into a String cannot fail.
-            let _ = write!(out, "{b:02X}");
+            let _ = write!(out, "{b:02x}");
         }
         out
     }
@@ -142,19 +159,21 @@ impl core::fmt::Display for Fingerprint {
 pub struct CapturedIdentity {
     /// The leaf certificate's fingerprint — the one the HMAC binds to.
     pub leaf: Fingerprint,
-    /// The root of the chain the server presented, which is what gets pinned afterwards.
+    /// The fingerprint of the topmost certificate the server presented, which is what
+    /// gets pinned afterwards ([`TlsPolicy::Pinned`]).
     ///
-    /// For the usual LAN arrangement — a self-signed CA and one leaf it signed — this is
-    /// the CA. For a server that presented only a leaf, it is that leaf. For one that
-    /// sent a leaf and an intermediate but not its root, it is the intermediate: still
-    /// sound, since that is what signed the leaf the HMAC verified, but it will need
-    /// re-pairing when the intermediate rotates.
+    /// For the usual LAN arrangement — a self-signed CA and one leaf it signed, both sent —
+    /// this is the CA. A server may leave its root out of the chain (RFC 8446 §4.4.2
+    /// allows it); for one that presented only a leaf, this is that leaf, and for one that
+    /// sent a leaf and an intermediate, the intermediate. Both are still sound — it is
+    /// what the HMAC-verified leaf chains to — but they need re-pairing when that
+    /// certificate rotates, which a pinned self-signed CA does not.
     ///
     /// Taking it from **this** chain matters. The specification says to pin "the
     /// self-signed CA (root) certificate" once the challenge succeeds, but the challenge
     /// binds the *leaf* — so a certificate obtained any other way would be pinned on no
     /// evidence at all (erratum E22).
-    pub root: CertificateDer<'static>,
+    pub root: Fingerprint,
     /// The whole chain, leaf first, for a caller that wants to look at it.
     pub chain: Vec<CertificateDer<'static>>,
 }
@@ -171,8 +190,9 @@ pub enum TlsPolicy {
     /// an administrator who has distributed a root expects it to be used. Revocation and
     /// local policy come with it for free, which a static list can never provide.
     Web,
-    /// Exactly one certificate, and nothing else. For every LAN connection after pairing.
-    PinnedCa(CertificateDer<'static>),
+    /// Exactly one certificate, by fingerprint. For every LAN connection after pairing,
+    /// and for a 6B communication client holding the `certificateFingerprint` it was sent.
+    Pinned(Fingerprint),
     /// **Trust nothing, record everything.** For LAN *pairing* and nothing else.
     ///
     /// The handshake is allowed to succeed against any certificate, because at this point
@@ -230,25 +250,16 @@ impl TlsClient {
                     }))
                     .with_no_client_auth()
             }
-            TlsPolicy::PinnedCa(ca) => {
-                let mut roots = RootCertStore::empty();
-                roots
-                    .add(ca.clone())
-                    .map_err(|e| Error::Tls(e.to_string()))?;
-                let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-                    Arc::new(roots),
-                    provider,
-                )
-                .build()
-                .map_err(|e| Error::Tls(e.to_string()))?;
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(Recording {
-                        inner: Verifier::Real(inner),
-                        captured: captured.clone(),
-                    }))
-                    .with_no_client_auth()
-            }
+            TlsPolicy::Pinned(pin) => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Recording {
+                    inner: Verifier::Pinned {
+                        pin: *pin,
+                        provider,
+                    },
+                    captured: captured.clone(),
+                }))
+                .with_no_client_auth(),
             TlsPolicy::LanPairingOnly => builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(Recording {
@@ -339,7 +350,63 @@ impl Capture {
 #[derive(Debug)]
 enum Verifier {
     Real(Arc<dyn ServerCertVerifier>),
+    Pinned {
+        pin: Fingerprint,
+        provider: Arc<CryptoProvider>,
+    },
     AcceptAnything(Arc<CryptoProvider>),
+}
+
+#[cfg(feature = "tokio")]
+impl Verifier {
+    /// The provider whose signature algorithms check the handshake, for the two verifiers
+    /// that do not delegate to a real one.
+    fn provider(&self) -> Option<&Arc<CryptoProvider>> {
+        match self {
+            Verifier::Real(_) => None,
+            Verifier::Pinned { provider, .. } | Verifier::AcceptAnything(provider) => {
+                Some(provider)
+            }
+        }
+    }
+}
+
+/// The pinned-certificate check: the leaf is the pin, or a presented certificate is and the
+/// leaf validates against it as the only trust anchor.
+#[cfg(feature = "tokio")]
+fn verify_pinned(
+    pin: &Fingerprint,
+    provider: &Arc<CryptoProvider>,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    ocsp_response: &[u8],
+    now: UnixTime,
+) -> Result<ServerCertVerified, TlsError> {
+    // The exact certificate that was pinned: nothing to chain, and the handshake signature
+    // (checked separately, against this certificate's key) proves the server holds it.
+    if Fingerprint::of(end_entity).matches(pin) {
+        return Ok(ServerCertVerified::assertion());
+    }
+    let Some(anchor) = intermediates
+        .iter()
+        .find(|cert| Fingerprint::of(cert).matches(pin))
+    else {
+        return Err(TlsError::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ));
+    };
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(anchor.clone().into_owned())
+        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| TlsError::General(e.to_string()))?;
+    verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
 }
 
 #[cfg(feature = "tokio")]
@@ -369,7 +436,7 @@ impl ServerCertVerifier for Recording {
         // roots at that leaf, which is what a self-signed single certificate means.
         self.captured.set(CapturedIdentity {
             leaf: Fingerprint::of(end_entity),
-            root: chain.last().cloned().unwrap_or(leaf),
+            root: Fingerprint::of(chain.last().unwrap_or(&leaf)),
             chain,
         });
 
@@ -377,6 +444,15 @@ impl ServerCertVerifier for Recording {
             Verifier::Real(inner) => {
                 inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
             }
+            Verifier::Pinned { pin, provider } => verify_pinned(
+                pin,
+                provider,
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
             // The whole point: no trust anchor exists yet, and the HMAC that follows is
             // what decides. See `TlsPolicy::LanPairingOnly`.
             Verifier::AcceptAnything(_) => Ok(ServerCertVerified::assertion()),
@@ -389,16 +465,17 @@ impl ServerCertVerifier for Recording {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        match &self.inner {
-            Verifier::Real(inner) => inner.verify_tls12_signature(message, cert, dss),
+        match (&self.inner, self.inner.provider()) {
+            (Verifier::Real(inner), _) => inner.verify_tls12_signature(message, cert, dss),
             // Still a real signature check: an attacker must at least hold the key for
             // the certificate he presented, so he cannot replay somebody else's.
-            Verifier::AcceptAnything(provider) => verify_tls12_signature(
+            (_, Some(provider)) => verify_tls12_signature(
                 message,
                 cert,
                 dss,
                 &provider.signature_verification_algorithms,
             ),
+            (_, None) => Err(TlsError::General("no signature verifier".into())),
         }
     }
 
@@ -408,23 +485,27 @@ impl ServerCertVerifier for Recording {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        match &self.inner {
-            Verifier::Real(inner) => inner.verify_tls13_signature(message, cert, dss),
-            Verifier::AcceptAnything(provider) => verify_tls13_signature(
+        match (&self.inner, self.inner.provider()) {
+            (Verifier::Real(inner), _) => inner.verify_tls13_signature(message, cert, dss),
+            // Still a real signature check: an attacker must at least hold the key for
+            // the certificate he presented, so he cannot replay somebody else's.
+            (_, Some(provider)) => verify_tls13_signature(
                 message,
                 cert,
                 dss,
                 &provider.signature_verification_algorithms,
             ),
+            (_, None) => Err(TlsError::General("no signature verifier".into())),
         }
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        match &self.inner {
-            Verifier::Real(inner) => inner.supported_verify_schemes(),
-            Verifier::AcceptAnything(provider) => provider
+        match (&self.inner, self.inner.provider()) {
+            (Verifier::Real(inner), _) => inner.supported_verify_schemes(),
+            (_, Some(provider)) => provider
                 .signature_verification_algorithms
                 .supported_schemes(),
+            (_, None) => Vec::new(),
         }
     }
 }
@@ -608,10 +689,17 @@ mod tests {
         let der = CertificateDer::from(alloc::vec![1u8, 2, 3, 4]);
         let fp = Fingerprint::of(&der);
         let text = fp.to_hex();
-        assert_eq!(text.len(), 32 * 3 - 1, "32 bytes, colon-separated");
+        assert_eq!(text.len(), 64, "32 bytes, plain hexadecimal");
+        assert_eq!(text, text.to_lowercase());
         assert_eq!(Fingerprint::parse(&text).unwrap(), fp);
-        // And without the colons, which is the other way tools print them.
-        assert_eq!(Fingerprint::parse(&text.replace(':', "")).unwrap(), fp);
+        // And with colons and in capitals, which is how openssl prints them.
+        let colons = text
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| core::str::from_utf8(pair).unwrap().to_uppercase())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(Fingerprint::parse(&colons).unwrap(), fp);
         assert!(fp.matches(&Fingerprint::of(&der)));
     }
 
@@ -643,7 +731,7 @@ mod tests {
         assert!(TlsPolicy::Web.authenticates());
         assert!(!TlsPolicy::LanPairingOnly.authenticates());
         let der = CertificateDer::from(alloc::vec![1u8, 2, 3]);
-        assert!(TlsPolicy::PinnedCa(der).authenticates());
+        assert!(TlsPolicy::Pinned(Fingerprint::of(&der)).authenticates());
     }
 
     /// Every configuration this crate builds names its provider, so `rustls`'s own
@@ -717,20 +805,13 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[test]
-    fn a_pinned_policy_refuses_something_that_is_not_a_certificate() {
-        let nonsense = CertificateDer::from(alloc::vec![0u8; 8]);
-        assert!(TlsClient::new(&TlsPolicy::PinnedCa(nonsense)).is_err());
-    }
-
-    #[cfg(feature = "tokio")]
-    #[test]
     fn a_changed_leaf_mid_attempt_is_noticed() {
         let capture = Capture::default();
         let one = CertificateDer::from(alloc::vec![1u8; 32]);
         let two = CertificateDer::from(alloc::vec![2u8; 32]);
         let identity = |der: &CertificateDer<'static>| CapturedIdentity {
             leaf: Fingerprint::of(der),
-            root: der.clone(),
+            root: Fingerprint::of(der),
             chain: alloc::vec![der.clone()],
         };
         capture.set(identity(&one));
@@ -758,7 +839,7 @@ mod tests {
 
         // A client that pins this CA builds.
         #[cfg(feature = "tokio")]
-        assert!(TlsClient::new(&TlsPolicy::PinnedCa(endpoint.ca.clone())).is_ok());
+        assert!(TlsClient::new(&TlsPolicy::Pinned(Fingerprint::of(&endpoint.ca))).is_ok());
     }
 
     #[cfg(feature = "connect-server")]

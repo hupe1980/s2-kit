@@ -1061,3 +1061,29 @@ fn a_side_hears_its_own_validators_warnings_about_what_it_sent() {
     assert!(warned, "the sender should hear its own validator");
     assert_eq!(c.cem.stats().sent_with_warnings, 1);
 }
+
+#[test]
+fn a_handshake_under_s2_connect_is_acknowledged_and_changes_nothing() {
+    // `S2C §Communication - JSON messages`: under S2 Connect "the Handshake and
+    // HandshakeResponse messages can not be sent". The version was settled by
+    // `initiateSession`; a peer that sends one anyway must not undo that.
+    let now = at("2024-01-01T12:00:00Z");
+    let mut cem = CemSession::new(CemConfig::default().pre_negotiated(WireProfile::V1_0_0));
+    cem.open(now);
+    while cem.poll_transmit().is_some() {}
+    let inbound = cem.handle_text(
+        r#"{"message_type":"Handshake","message_id":"rm-hs","role":"RM","supported_protocol_versions":["0.0.2-beta"]}"#,
+        now,
+    );
+    assert!(inbound.accepted(), "tolerated, and reported");
+    assert!(inbound.report.contains(rules::HANDSHAKE_UNDER_CONNECT));
+    assert_eq!(cem.profile(), WireProfile::V1_0_0, "the profile stays");
+    let sent: Vec<MessageKind> = std::iter::from_fn(|| cem.poll_transmit())
+        .map(|out| out.kind)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![MessageKind::ReceptionStatus],
+        "an acknowledgement, and no HandshakeResponse"
+    );
+}

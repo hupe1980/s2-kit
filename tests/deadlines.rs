@@ -261,7 +261,7 @@ fn an_s2_connect_session_has_no_handshake_deadline_at_all() {
 }
 
 #[test]
-fn the_reconnection_ceiling_grows_with_the_attempt_the_application_counts() {
+fn the_reconnection_hint_is_jittered_below_a_ceiling_that_grows_with_the_attempt() {
     // A session is one connection, so the engine cannot count failed reconnections: it
     // is the application that dials again. Without carrying the number across, every
     // `Closed` event recommended the same two-second ceiling for ever — which is a
@@ -285,13 +285,31 @@ fn the_reconnection_ceiling_grows_with_the_attempt_the_application_counts() {
                 .flatten()
         })
         .collect();
-    assert_eq!(
-        ceilings,
-        vec![
-            Some(Duration::from_secs(2)),
-            Some(Duration::from_secs(4)),
-            Some(Duration::from_secs(8)),
-            Some(Duration::from_secs(16)),
-        ]
-    );
+    // Each hint is drawn from `[0, ceiling]` — jittered, so a fleet does not reconnect in
+    // lockstep — and the ceiling doubles with the attempt.
+    for (attempt, hint) in ceilings.iter().enumerate() {
+        let ceiling = Duration::from_secs(2 << attempt);
+        let hint = hint.expect("a hint after a transport loss");
+        assert!(hint <= ceiling, "attempt {attempt}: {hint:?} > {ceiling:?}");
+    }
+    // And the jitter is real: many draws at one attempt are not all the same.
+    let draws: std::collections::BTreeSet<u64> = (0..32)
+        .map(|_| {
+            let mut rm = RmSession::new(
+                RmConfig::default().after_failed_attempts(5),
+                s2_kit::testing::battery_details(),
+            );
+            rm.open(now);
+            rm.transport_closed(now);
+            std::iter::from_fn(|| rm.poll_event())
+                .find_map(|e| match e {
+                    RmEvent::Closed {
+                        reconnect_after, ..
+                    } => reconnect_after,
+                    _ => None,
+                })
+                .map_or(0, Duration::as_millis)
+        })
+        .collect();
+    assert!(draws.len() > 1, "every draw was {draws:?}");
 }

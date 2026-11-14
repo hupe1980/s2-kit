@@ -14,7 +14,7 @@ debug
 
 # cargo-fuzz working data. The targets are source and are committed; what they find is
 # not — the corpus is machine-generated and unbounded, and a crash belongs in `tests/`
-# with its input inlined. CI uploads artifacts when a nightly run fails.
+# with its input inlined.
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
@@ -34,9 +34,25 @@ lcov.info
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Local research / working notes (not published)
-concepts/
-specs/
+# Internal architecture notes (see concepts/README.md), anchored to the repository root.
+# ROADMAP.md is the spec of specs: every open item names its feature specification.
+#
+# The upstream corpus — clones of s2-json, s2-connect and s2-documentation, the
+# whitepaper, and the other implementations `cargo xtask interop` runs against — lives
+# at `concepts/reference/` and is covered by this line. All of it is Apache-2.0 or CC-BY
+# and re-cloned at will, indexed in `concepts/REFERENCES.md`; only the schemas are
+# vendored, into schema/s2-json/. `xtask` reads it there, or from `$S2_REFERENCE`.
+/concepts/
+
+# This project's own feature specifications, and the Spec Kit machinery that produces
+# them: one `specs/NNN-slug/` per ROADMAP item, `.specify/memory/constitution.md`, and
+# the `/speckit-*` skills. Same rule as `concepts/` — internal, and the published tree
+# may not cite a path its reader does not have; scripts/concepts-check.sh fails on one
+# that does. Until 2026-11-13 `specs/` held the corpus now under `concepts/reference/`.
+# Matching eebus, ocpp-kit, nuvec and speccoder.
+/specs/
+/.specify/
+/.claude/
 
 # Zola build output
 site/public/

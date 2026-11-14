@@ -47,8 +47,8 @@ struct State {
     /// "may only provide at most one item for each clientNodeId", and a queue that grew
     /// would hand out an action the user has already cancelled.
     pending: BTreeMap<NodeId, WaitAction>,
-    /// What each polling node has told us about itself.
-    seen: BTreeMap<NodeId, WaitingNode>,
+    /// What each polling node has told us about itself, and when it last polled.
+    seen: BTreeMap<NodeId, (WaitingNode, std::time::Instant)>,
 }
 
 impl LongPoll {
@@ -58,6 +58,14 @@ impl LongPoll {
     /// chose, so a map that grew one entry per identifier would be unbounded memory driven
     /// by unauthenticated input. A LAN endpoint talks to tens of devices.
     pub(super) const MAX_WAITING: usize = 256;
+
+    /// How long a node that stopped polling is remembered.
+    ///
+    /// Without expiry the bound above is a trap: anyone on the subnet posts 256 invented
+    /// identifiers once, the table is full for ever, and every genuine device after that
+    /// is ignored. A device that is really waiting polls every twenty seconds; one silent
+    /// for five minutes has gone, and its slot is free again.
+    pub(super) const SEEN_TTL: core::time::Duration = core::time::Duration::from_mins(5);
 
     /// The most nodes one poll may ask about. "The client can represent multiple nodes" is
     /// not "the client can represent every node".
@@ -88,7 +96,7 @@ impl LongPoll {
                 state
                     .seen
                     .iter()
-                    .map(|(id, node)| (*id, node.clone()))
+                    .map(|(id, (node, _))| (*id, node.clone()))
                     .collect()
             },
         )
@@ -99,6 +107,10 @@ impl LongPoll {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
+        let now = std::time::Instant::now();
+        state
+            .seen
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < Self::SEEN_TTL);
         let mut out = Vec::new();
         for node in nodes.iter().take(Self::MAX_PER_POLL) {
             // Remembering a node is what an unauthenticated caller can make us do, so it
@@ -110,7 +122,11 @@ impl LongPoll {
             {
                 continue;
             }
-            let seen = state.seen.entry(node.client_node_id).or_default();
+            let (seen, at) = state
+                .seen
+                .entry(node.client_node_id)
+                .or_insert_with(|| (WaitingNode::default(), now));
+            *at = now;
             // A poll that carries a description is the answer to `sendNodeDescription`;
             // one that does not must not erase what we were told last time.
             if node.client_node_description.is_some() {

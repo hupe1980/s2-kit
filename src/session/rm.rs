@@ -244,6 +244,10 @@ pub enum RmEvent {
         /// Why.
         reason: CloseReason,
         /// How long to wait before reconnecting, if reconnecting makes sense.
+        ///
+        /// Already jittered as `S2C §Reconnection strategy` prescribes when built with
+        /// `std`; the un-jittered ceiling without it — draw with
+        /// [`Backoff::delay`](super::Backoff::delay) there.
         reconnect_after: Option<Duration>,
     },
 }
@@ -344,6 +348,17 @@ impl RmSession {
         self.core.profile
     }
 
+    /// The version string the handshake settled on, exactly as it crossed the wire —
+    /// or the pre-negotiated one under S2 Connect. `None` until then.
+    ///
+    /// [`profile`](Self::profile) is what the codec reads with; this is what an operator
+    /// greps for, and the evidence R2's trigger is evaluated on: which string a peer
+    /// actually *selects*.
+    #[must_use]
+    pub fn negotiated_version(&self) -> Option<&ProtocolVersion> {
+        self.negotiated.as_ref()
+    }
+
     /// What this session has done, for an operator's metrics rather than for the
     /// application: how many messages crossed, how many were refused, and how long the
     /// peer takes to answer.
@@ -422,8 +437,10 @@ impl RmSession {
     /// same check; this one is for the frames that never get that far.
     pub fn handle_text(&mut self, text: &str, now: Timestamp) -> Inbound {
         if self.core.state.is_closed() {
+            let peek = crate::codec::peek(text).ok();
             return Inbound {
-                kind: crate::codec::peek(text).ok().and_then(|p| p.kind),
+                kind: peek.as_ref().and_then(|p| p.kind),
+                message_id: peek.and_then(|p| p.message_id),
                 status: ReceptionStatusValues::Ok,
                 report: Report::new(),
             };
@@ -471,6 +488,7 @@ impl RmSession {
                 });
                 Inbound {
                     kind,
+                    message_id: error.peek().and_then(|p| p.message_id),
                     status: status.status,
                     report,
                 }
@@ -481,7 +499,7 @@ impl RmSession {
     /// Feed in one already-decoded message.
     pub fn handle_message(&mut self, message: Message, now: Timestamp) -> Inbound {
         if self.core.state.is_closed() {
-            return Inbound::ignored(message.kind());
+            return Inbound::ignored(message.kind(), message.id());
         }
 
         // A ReceptionStatus is the one message that is never itself acknowledged.
@@ -489,6 +507,7 @@ impl RmSession {
             self.on_reception_status(status, now);
             return Inbound {
                 kind: Some(MessageKind::ReceptionStatus),
+                message_id: None,
                 status: ReceptionStatusValues::Ok,
                 report: Report::new(),
             };
@@ -496,7 +515,7 @@ impl RmSession {
 
         let kind = message.kind();
         let Some(id) = message.id() else {
-            return Inbound::ignored(kind);
+            return Inbound::ignored(kind, None);
         };
 
         // A duplicate delivery is answered again with the same status and not processed
@@ -520,6 +539,7 @@ impl RmSession {
             });
             return Inbound {
                 kind: Some(kind),
+                message_id: Some(id),
                 status: previous,
                 report,
             };
@@ -561,6 +581,7 @@ impl RmSession {
             }
             return Inbound {
                 kind: Some(kind),
+                message_id: Some(id),
                 status,
                 report,
             };
@@ -583,6 +604,7 @@ impl RmSession {
             });
             return Inbound {
                 kind: Some(kind),
+                message_id: Some(id),
                 status,
                 report,
             };
@@ -601,6 +623,7 @@ impl RmSession {
         self.process(message, now);
         Inbound {
             kind: Some(kind),
+            message_id: Some(id),
             status: ReceptionStatusValues::Ok,
             report,
         }
@@ -608,6 +631,18 @@ impl RmSession {
 
     /// Act on a message that has been accepted and acknowledged.
     fn process(&mut self, message: Message, now: Timestamp) {
+        // Under S2 Connect the version was settled by session initiation, and
+        // `S2C §Communication - JSON messages` says these "can not be sent". One that
+        // arrives anyway is acknowledged — `S2-STATE-003` reports it — and otherwise
+        // ignored: it must not renegotiate what `initiateSession` already decided.
+        if self.core.s2_connect
+            && matches!(
+                message,
+                Message::Handshake(_) | Message::HandshakeResponse(_)
+            )
+        {
+            return;
+        }
         match &message {
             Message::Handshake(h) => {
                 self.handshake_seen = true;
@@ -880,6 +915,13 @@ impl RmSession {
             // instruction to come straight back, whoever sent it.
             CloseReason::PeerRequested(SessionRequestType::Reconnect)
             | CloseReason::LocallyRequested(SessionRequestType::Reconnect) => Some(Duration::ZERO),
+            // `S2C §Reconnection strategy`: `random(0, min(max, base × 2^n))`. Drawn here
+            // when there is an RNG to draw from, so a fleet that sleeps exactly this long
+            // does not reconnect in lockstep; without `std` it is the ceiling, and the
+            // firmware draws with [`Backoff::delay`](super::Backoff::delay).
+            #[cfg(feature = "std")]
+            _ => Some(self.backoff.delay_with(self.core.reconnect_attempt)),
+            #[cfg(not(feature = "std"))]
             _ => Some(self.backoff.ceiling(self.core.reconnect_attempt)),
         };
         self.core.state = SessionState::Closed(reason.clone());

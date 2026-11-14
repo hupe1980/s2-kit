@@ -11,8 +11,13 @@
 //! cargo xtask all                 everything above, in order
 //! ```
 //!
-//! `all` skips `gen-model-reference` and `check-docs` when `specs/s2-documentation` is
-//! absent, so a contributor without it can still regenerate the rest. CI therefore runs
+//! The upstream repositories are read from a reference directory (see [`reference_dir`]):
+//! `$S2_REFERENCE` when set, else the gitignored `concepts/reference/` of this checkout.
+//! It holds clones of `s2-json`, `s2-connect` and `s2-documentation`, and the peers of
+//! `interop` under `implementations/`.
+//!
+//! `all` skips `gen-model-reference` and `check-docs` when `s2-documentation` is absent
+//! there, so a contributor without it can still regenerate the rest. CI therefore runs
 //! those two by name, where a missing clone is an error rather than a shrug.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,12 +67,26 @@ fn gen_site_examples(root: &Path) -> Result<()> {
 }
 
 fn skip_if_no_specs(e: anyhow::Error) -> Result<()> {
-    if e.to_string().contains("specs/") {
+    if e.to_string().contains(MISSING_REFERENCE) {
         eprintln!("skipping: {e}");
         Ok(())
     } else {
         Err(e)
     }
+}
+
+/// Every "this upstream clone is not there" error contains this, so `all` can tell a
+/// missing clone (skip) from a broken one (fail).
+const MISSING_REFERENCE: &str = "is not present in the reference directory";
+
+/// Where the upstream S2 repositories live: `$S2_REFERENCE` when set, else the gitignored
+/// `concepts/reference/` of this checkout. Expected inside: `s2-json/` (a full clone, for
+/// its `v0.0.2-beta` tag), `s2-connect/`, `s2-documentation/`, and the `interop` peers
+/// under `implementations/`.
+fn reference_dir(root: &Path) -> PathBuf {
+    std::env::var_os("S2_REFERENCE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("concepts/reference"))
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -95,52 +114,54 @@ fn repo_root() -> Result<PathBuf> {
 /// too, and covered by the same licence. It is taken from git rather than from the
 /// working tree, because a checkout can only be at one tag at a time.
 fn vendor_specs(root: &Path) -> Result<()> {
-    let specs = root.join("specs/s2-json");
+    let specs = reference_dir(root).join("s2-json");
     if !specs.exists() {
-        bail!("specs/s2-json is not present; clone it there first (it is gitignored)");
+        bail!(
+            "s2-json {MISSING_REFERENCE} ({}); clone it there first, or set $S2_REFERENCE",
+            specs.display()
+        );
     }
+    check_upstream_tags(&specs)?;
     let target = root.join("schema/s2-json");
 
+    // Everything from git objects at the release tags, never from the working tree:
+    // upstream `main` moves between releases (it gained two `ControlType` description
+    // fixes after `v1.0.0`), and a vendored tree that follows `main` stops being the
+    // version the crate claims to speak — and turns CI red on someone else's commit.
+    let current = s2_kit::types::WireProfile::V1_0_0.connect_version_str();
     let mut copied = 0usize;
     for dir in ["messages", "schemas"] {
-        let from = specs.join(dir);
         let to = target.join(dir);
         std::fs::create_dir_all(&to)?;
-        for entry in std::fs::read_dir(&from)? {
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|e| e == "json") {
-                std::fs::copy(entry.path(), to.join(entry.file_name()))?;
+        for file in git_ls(&specs, current, dir)? {
+            if Path::new(&file).extension().is_some_and(|e| e == "json") {
+                let bytes = git_show(&specs, current, &format!("{dir}/{file}"))?;
+                std::fs::write(to.join(&file), bytes)?;
                 copied += 1;
             }
         }
     }
 
     // The licence travels with the files it covers.
-    std::fs::copy(specs.join("LICENSE"), target.join("LICENSE"))
-        .context("copying the upstream LICENSE, which Apache-2.0 §4(a) requires")?;
+    std::fs::write(
+        target.join("LICENSE"),
+        git_show(&specs, current, "LICENSE")?,
+    )
+    .context("writing the upstream LICENSE, which Apache-2.0 §4(a) requires")?;
 
-    // The beta profile, from the tag rather than the working tree.
-    let beta = target.join("profiles/v0.0.2-beta");
+    // The beta profile: the files where the older tag differs.
+    let beta_tag = s2_kit::types::WireProfile::V0_0_2Beta.connect_version_str();
+    let beta = target.join("profiles").join(beta_tag);
     std::fs::create_dir_all(&beta)?;
     for file in BETA_PROFILE_FILES {
-        let path = format!("v0.0.2-beta:s2-json-schema/messages/{file}");
-        let output = std::process::Command::new("git")
-            .args(["-C", &specs.to_string_lossy(), "show", &path])
-            .output()
-            .context("running git to read the v0.0.2-beta tag")?;
-        if !output.status.success() {
-            bail!(
-                "specs/s2-json has no v0.0.2-beta tag (a shallow clone will not do): {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        std::fs::write(beta.join(file), &output.stdout)?;
+        let bytes = git_show(&specs, beta_tag, &format!("s2-json-schema/messages/{file}"))?;
+        std::fs::write(beta.join(file), bytes)?;
         copied += 1;
     }
 
-    let revision = git_revision(&specs).unwrap_or_else(|| "unknown".to_string());
-    write_schema_readme(&target, &revision)?;
-    println!("vendored {copied} files into schema/s2-json from specs/s2-json at {revision}");
+    let revision = git_revision(&specs, current).unwrap_or_else(|| "unknown".to_string());
+    write_schema_readme(&target, &format!("tag `{current}`, commit `{revision}`"))?;
+    println!("vendored {copied} files into schema/s2-json from s2-json {current} ({revision})");
     Ok(())
 }
 
@@ -150,9 +171,107 @@ fn vendor_specs(root: &Path) -> Result<()> {
 /// this list is where that becomes visible rather than a surprise.
 const BETA_PROFILE_FILES: &[&str] = &["DDBC.SystemDescription.schema.json"];
 
-fn git_revision(repo: &Path) -> Option<String> {
+/// Fails if `s2-json` carries a release tag this crate has no wire profile for.
+///
+/// A new S2 JSON version is a new row in the profile table (D5) and, if its shape
+/// differs, a new overlay; a version nobody notices is a peer that cannot connect. CI
+/// runs this against a fresh clone on every push, so the first change after a new
+/// upstream tag turns the `generated` job red rather than waiting to be read about.
+fn check_upstream_tags(specs: &Path) -> Result<()> {
     let output = std::process::Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "rev-parse", "HEAD"])
+        .args(["-C", &specs.to_string_lossy(), "tag", "--list", "v*"])
+        .output()
+        .context("running git to list the s2-json tags")?;
+    if !output.status.success() {
+        bail!(
+            "git tag failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let tags = String::from_utf8_lossy(&output.stdout);
+    let unknown: Vec<&str> = tags
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            s2_kit::types::ProtocolVersion::from(*t)
+                .wire_profile()
+                .is_none()
+        })
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "s2-json has release tags with no wire profile: {}. Diff the schemas against the \
+             nearest known tag, add a `WireProfile` variant (and an overlay if the shape \
+             differs), and record it in concepts/DECISIONS.md",
+            unknown.join(", ")
+        );
+    }
+    let known = s2_kit::types::WireProfile::ALL.len();
+    let seen = tags.lines().filter(|t| !t.trim().is_empty()).count();
+    if seen < known {
+        bail!(
+            "s2-json has {seen} release tags but this crate speaks {known} profiles; \
+             is the clone shallow? `vendor-specs` needs the full history"
+        );
+    }
+    Ok(())
+}
+
+/// The bytes of `path` at `tag`. A shallow clone has no tags, so says so.
+fn git_show(repo: &Path, tag: &str, path: &str) -> Result<Vec<u8>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "show",
+            &format!("{tag}:{path}"),
+        ])
+        .output()
+        .context("running git show")?;
+    if !output.status.success() {
+        bail!(
+            "{} has no {tag}:{path} (a shallow clone has no tags): {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// The file names directly under `dir` at `tag`.
+fn git_ls(repo: &Path, tag: &str, dir: &str) -> Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "ls-tree",
+            "--name-only",
+            &format!("{tag}:{dir}"),
+        ])
+        .output()
+        .context("running git ls-tree")?;
+    if !output.status.success() {
+        bail!(
+            "{} has no {tag}:{dir}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn git_revision(repo: &Path, rev: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "rev-parse",
+            &format!("{rev}^{{commit}}"),
+        ])
         .output()
         .ok()?;
     output
@@ -175,7 +294,7 @@ fn write_schema_readme(target: &Path, revision: &str) -> Result<()> {
             "© FlexiblePower Alliance Network, distributed under the **Apache License\n",
             "2.0** — see `LICENSE`, which is upstream's own copy. It is **not** covered\n",
             "by this crate's `MIT OR Apache-2.0`.\n\n",
-            "Vendored from revision `{}`.\n\n",
+            "Vendored from {}.\n\n",
             "| Path | What |\n|---|---|\n",
             "| `messages/` | The 36 message schemas of S2 JSON v1.0.0 |\n",
             "| `schemas/` | The component schemas they reference |\n",
@@ -216,10 +335,10 @@ fn write_schema_readme(target: &Path, revision: &str) -> Result<()> {
             "rather than three hundred of JSON. They are used by\n",
             "`tests/model_matches_schema.rs`, which validates every message against them\n",
             "with a real JSON Schema validator, and by `cargo xtask gen-schema-table`.\n\n",
-            "To refresh them, clone `s2-json` into `specs/` (gitignored, and it must not\n",
-            "be a shallow clone — the `v0.0.2-beta` tag is read from git history) and run\n",
-            "`cargo xtask vendor-specs`. CI fails if the result differs from what is\n",
-            "committed.\n",
+            "To refresh them, clone `s2-json` into the directory `$S2_REFERENCE` names\n",
+            "(it must not be a shallow clone — the `v0.0.2-beta` tag is read from git\n",
+            "history) and run `cargo xtask vendor-specs`. CI fails if the result differs\n",
+            "from what is committed.\n",
         ),
         revision
     );
@@ -508,7 +627,7 @@ fn bounds(min: Option<u64>, max: Option<u64>) -> String {
 fn front_matter(title: &str, description: &str, weight: Option<usize>) -> String {
     // A description is rendered as plain text, in a `<meta>` tag and as the page's lede.
     // Markdown left in it shows up as literal backticks in search results.
-    let description = description.replace('`', "").replace('*', "");
+    let description = description.replace(['`', '*'], "");
     let mut out = String::from("+++\n");
     let _ = writeln!(out, "title = {title:?}");
     let _ = writeln!(out, "description = {description:?}");
@@ -839,10 +958,11 @@ struct DocVariant {
 }
 
 fn load_structured_docs(root: &Path) -> Result<Vec<DocType>> {
-    let dir = root.join("specs/s2-documentation/structured-documentation");
+    let dir = reference_dir(root).join("s2-documentation/structured-documentation");
     if !dir.exists() {
         bail!(
-            "specs/s2-documentation is not present (it is gitignored); clone it to run this task"
+            "s2-documentation {MISSING_REFERENCE} ({}); clone it to run this task",
+            dir.display()
         );
     }
     let mut out = Vec::new();
@@ -1008,10 +1128,7 @@ fn rust_model(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
             for line in text.lines() {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("pub struct ") {
-                    let name = rest
-                        .split(|c: char| c == ' ' || c == '{' || c == '<' || c == ';')
-                        .next()
-                        .unwrap_or_default();
+                    let name = rest.split([' ', '{', '<', ';']).next().unwrap_or_default();
                     current = Some(name.to_string());
                     continue;
                 }
@@ -1035,11 +1152,11 @@ fn rust_model(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
                     if trimmed.starts_with('#') || trimmed.starts_with(")]") {
                         continue;
                     }
-                    if let Some(rest) = trimmed.strip_prefix("pub ") {
-                        if let Some((field, _)) = rest.split_once(':') {
-                            let wire = rename.take().unwrap_or_else(|| field.trim().to_string());
-                            out.entry(name.clone()).or_default().insert(wire);
-                        }
+                    if let Some(rest) = trimmed.strip_prefix("pub ")
+                        && let Some((field, _)) = rest.split_once(':')
+                    {
+                        let wire = rename.take().unwrap_or_else(|| field.trim().to_string());
+                        out.entry(name.clone()).or_default().insert(wire);
                     }
                 }
             }
@@ -1056,7 +1173,7 @@ fn rust_model(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
 struct Peer {
     /// What the matrix calls it.
     name: &'static str,
-    /// The crate directory under `specs/_reference/`.
+    /// The crate directory under the reference directory's `implementations/`.
     path: &'static str,
     /// The binary `cargo build --release` produces.
     bin: &'static str,
@@ -1134,10 +1251,10 @@ const PEERS: &[Peer] = &[
 /// s2-kit on both ends. This one puts an implementation nobody here wrote on the other
 /// side of a real socket.
 fn interop(root: &Path) -> Result<()> {
-    let reference = root.join("specs/_reference");
+    let reference = reference_dir(root).join("implementations");
     if !reference.is_dir() {
         bail!(
-            "specs/_reference is missing; run `cargo xtask vendor-specs` first ({})",
+            "implementations/ {MISSING_REFERENCE} ({}); clone the peers there first",
             reference.display()
         );
     }
@@ -1261,7 +1378,7 @@ fn build_interop_cem(root: &Path) -> Result<PathBuf> {
 fn build_peer(reference: &Path, work: &Path, peer: &Peer) -> Result<PathBuf> {
     let source = reference.join(peer.path);
     if !source.is_dir() {
-        bail!("{} is not present under specs/_reference", peer.path);
+        bail!("{} {MISSING_REFERENCE} ({})", peer.path, source.display());
     }
     let target = work.join(peer.bin);
     let binary = target.join("target/release").join(peer.bin);

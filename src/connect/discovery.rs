@@ -10,7 +10,7 @@
 //!   _rm._sub._s2connect._tcp.local.             hosts a Resource Manager
 //!   TXT  txtver=1                               this version of the specification
 //!        e_name=EVSE1038                        what to show the user
-//!        pairingUrl=https://EVSE1038.local/v1/  where to pair
+//!        pairingUrl=https://EVSE1038.local/     where to pair (no version: the index says)
 //! ```
 //!
 //! The record model, including which TXT keys are mandatory and why both spellings of the
@@ -139,7 +139,7 @@ impl Discovery {
     ///     443,
     ///     &ServiceRecord {
     ///         endpoint_name: Some("Acme charger".into()),
-    ///         pairing_url: Some("https://EVSE1038.local/v1/".into()),
+    ///         pairing_url: Some("https://EVSE1038.local/".into()),
     ///         roles: vec![Role::Rm],
     ///         ..ServiceRecord::default()
     ///     },
@@ -367,7 +367,7 @@ mod tests {
         ServiceRecord {
             endpoint_name: Some("Acme charger".into()),
             endpoint_logo_url: None,
-            pairing_url: Some("https://EVSE1038.local/v1/".into()),
+            pairing_url: Some("https://EVSE1038.local/".into()),
             longpolling_url: None,
             roles: alloc::vec![Role::Rm],
         }
@@ -410,7 +410,7 @@ mod tests {
             addresses: Vec::new(),
             record: record(),
         };
-        assert_eq!(found.pairing_url(), Some("https://EVSE1038.local/v1/"));
+        assert_eq!(found.pairing_url(), Some("https://EVSE1038.local/"));
         assert_eq!(found.longpolling_url(), None);
         assert_eq!(found.hosts(Role::Rm), Some(true));
         assert_eq!(found.hosts(Role::Cem), Some(false));

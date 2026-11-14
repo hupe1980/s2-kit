@@ -312,7 +312,26 @@ impl TokenStore {
                 granted: Some(now),
             },
         );
-        self.tokens.truncate(Self::MAX);
+        self.evict();
+    }
+
+    /// Bring the list back to [`Self::MAX`], dropping the **oldest pending grant** first.
+    ///
+    /// Truncating from the end would drop whatever is oldest, and the oldest entry is
+    /// usually the token in force: four `initiateSession` calls inside fifteen seconds
+    /// whose replies all went missing would push it out, while the client — which never
+    /// saw any of the grants — still holds only that one. `S2C §Interruption`: the old
+    /// token is not invalidated until "both nodes confirm that they have successfully
+    /// persisted the new accessToken".
+    fn evict(&mut self) {
+        while self.tokens.len() > Self::MAX {
+            let victim = self
+                .tokens
+                .iter()
+                .rposition(|held| held.granted.is_some())
+                .unwrap_or(self.tokens.len() - 1);
+            self.tokens.remove(victim);
+        }
     }
 
     /// Record a token that is already in force, such as the one pairing produced.
@@ -327,7 +346,7 @@ impl TokenStore {
                 granted: None,
             },
         );
-        self.tokens.truncate(Self::MAX);
+        self.evict();
     }
 
     /// Activate a granted token and retire every other, as `confirmAccessToken` does.
@@ -452,6 +471,8 @@ pub struct SessionInitClient {
     /// How many tokens of the store have been tried since the last success.
     tried: usize,
     granted: Option<SessionGrant>,
+    /// Accept a `ws://` `websocketUrl`. Off unless a test asks for it.
+    insecure_websocket: bool,
 }
 
 impl SessionInitClient {
@@ -474,7 +495,19 @@ impl SessionInitClient {
             attempted: None,
             tried: 0,
             granted: None,
+            insecure_websocket: false,
         }
+    }
+
+    /// Accept a plaintext `ws://` `websocketUrl` — for a loopback test and nothing else.
+    ///
+    /// `S2C §Encrypted connection`: "S2 **MUST NOT** be sent over unencrypted channels.
+    /// Therefore a wss connection … must be used." The communication token is a bearer;
+    /// over `ws://` anyone on the path can read it and the session it opens.
+    #[must_use]
+    pub fn allowing_insecure_websocket(mut self) -> Self {
+        self.insecure_websocket = true;
+        self
     }
 
     /// Offer a different set of S2 JSON message versions, newest first.
@@ -597,6 +630,16 @@ impl SessionInitClient {
             websocket_url,
             websocket_token,
         } = details;
+        let secure = websocket_url
+            .get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss://"));
+        if !secure && !self.insecure_websocket {
+            self.phase = Phase::Failed;
+            return Err(ConnectError::OutOfOrder {
+                got: "a websocketUrl that is not wss://",
+                expected: "an encrypted WebSocket (S2C §Encrypted connection)",
+            });
+        }
         Ok(SessionCredentials {
             websocket_url,
             websocket_token,
@@ -867,6 +910,26 @@ mod tests {
     }
 
     #[test]
+    fn four_unanswered_grants_inside_the_window_keep_the_token_in_force() {
+        // Every grant is still inside its fifteen seconds, so none can be retired as stale,
+        // and the list is full: the one to drop is a grant, never the token in force.
+        let active = AccessToken::new("in-force");
+        let mut store = TokenStore::new(active.clone());
+        for i in 0..6 {
+            store.add(AccessToken::new(alloc::format!("grant-{i}")), t(i));
+        }
+        assert_eq!(store.len(), TokenStore::MAX);
+        assert!(
+            store.accepts(&active),
+            "the token the client holds still opens the door"
+        );
+        assert!(
+            store.accepts(&AccessToken::new("grant-5")),
+            "and the newest grant is kept"
+        );
+    }
+
+    #[test]
     fn a_grant_nobody_confirmed_never_evicts_the_token_that_works() {
         // Four `initiateSession` calls whose replies never reached the client each add a
         // pending grant. With a four-deep list and no expiry, the fourth pushes the token
@@ -946,6 +1009,43 @@ mod tests {
         comm: u8,
     ) -> SessionCredentials {
         run_at(client, server, new_access, comm, t(0))
+    }
+
+    #[test]
+    fn a_websocket_url_that_is_not_encrypted_is_refused() {
+        // `S2C §Encrypted connection`: "S2 MUST NOT be sent over unencrypted channels."
+        // The communication token is a bearer; over `ws://` it is anyone's.
+        let (rm, cem) = ids();
+        let initial = AccessToken::from_entropy(&[1u8; 32]).expect("32 bytes");
+        let plaintext = |mut client: SessionInitClient| {
+            let mut server = SessionInitServer::new(
+                cem,
+                rm,
+                TokenStore::new(initial.clone()),
+                "ws://cem.example.com/s2",
+            );
+            let (bearer, request) = client.initiate().unwrap();
+            let grant = server
+                .initiate_session(&bearer, &request, &[2; 32], t(0))
+                .unwrap();
+            client.accept(grant, t(0)).unwrap();
+            let confirm = client.confirm().unwrap();
+            let details = server
+                .confirm_access_token(&confirm, &[3; 32], t(0))
+                .unwrap();
+            client.connected(details, t(0))
+        };
+        let refused = plaintext(SessionInitClient::new(
+            rm,
+            cem,
+            TokenStore::new(initial.clone()),
+        ));
+        assert!(matches!(refused, Err(ConnectError::OutOfOrder { .. })));
+        let allowed = plaintext(
+            SessionInitClient::new(rm, cem, TokenStore::new(initial.clone()))
+                .allowing_insecure_websocket(),
+        );
+        assert!(allowed.is_ok(), "a loopback test may opt in");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name         = "s2-kit"
-version      = "0.3.0"
+version      = "0.4.0"
 edition      = "2024"
 rust-version = "1.94"
 authors      = ["hupe1980"]
@@ -12,9 +12,9 @@ documentation = "https://docs.rs/s2-kit"
 readme       = "README.md"
 keywords     = ["s2", "energy", "flexibility", "en50491", "smart-grid"]
 categories   = ["api-bindings", "encoding", "embedded", "network-programming"]
-# `/site` is published at the `documentation` URL and nothing in the crate reads it. The
-# vendored schemas stay: the tests validate against them.
-exclude      = ["/concepts", "/specs", "/fuzz", "/.github", "/site"]
+# `/site` is the `homepage`, and nothing in the crate reads it. The vendored schemas stay:
+# the tests validate against them.
+exclude      = ["/concepts", "/specs", "/.specify", "/.claude", "/scripts", "/fuzz", "/.github", "/site"]
 
 [features]
 default = ["std", "uuid", "tls-ring"]
@@ -54,7 +54,7 @@ tls-aws-lc-rs = ["rustls?/aws-lc-rs", "tokio-rustls?/aws-lc-rs", "rcgen?/aws_lc_
 # transcripts read as well as written.
 testing = ["std"]
 
-# Structured logging from the drivers.
+# A span per session and an event per message from the drivers, keyed by `message_id`.
 tracing = ["dep:tracing"]
 
 # The `s2-kit` command line tool. `testing` carries the transcript reader `replay` needs.
@@ -84,7 +84,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"], optional = true }
 
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"], optional = true }
-rustls = { version = "0.23.44", default-features = false, features = ["std", "tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pki-types = { version = "1.15.1", optional = true }
 rustls-platform-verifier = { version = "0.7.0", optional = true }
 url = { version = "2.5.8", optional = true }
@@ -122,6 +122,9 @@ schemars = "1.2.2"
 criterion = { version = "0.8.0", features = ["html_reports"] }
 # `tests/properties.rs`.
 proptest = "1.11.0"
+# `tests/tracing.rs` captures what a subscriber would see.
+tracing = { version = "0.1.44", features = ["std"] }
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "std"] }
 # The official crate, linked so `tests/interop_s2energy.rs` can check the two models against
 # each other. A dev-dependency, not a container or a subprocess.
 s2energy = "0.3"
@@ -132,6 +135,10 @@ s2energy = "0.3"
 [[test]]
 name = "conversations"
 required-features = ["testing", "uuid"]
+
+[[test]]
+name = "tracing"
+required-features = ["tokio", "testing", "tracing"]
 
 [[test]]
 name = "deadlines"
@@ -192,8 +199,8 @@ required-features = ["testing"]
 name = "connect_pair"
 required-features = ["connect-client", "connect-server"]
 
-# A bare-WebSocket CEM the *official* example Resource Managers can dial. Not a demo: it
-# is the peer half of the interoperability matrix (M6), and it exits non-zero on a refusal.
+# A bare-WebSocket CEM the official example Resource Managers dial: the peer half of
+# `cargo xtask interop`, exiting non-zero on a refusal.
 [[example]]
 name = "interop_cem"
 required-features = ["connect-server", "tokio"]
@@ -224,6 +231,8 @@ doc_markdown = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 too_many_lines = "allow"
+# Its suggested `assert_eq!(v, [] as [T; 0])` is noisier than `assert!(v.is_empty())`.
+assert_is_empty = "allow"
 struct_excessive_bools = "allow"
 result_large_err = "allow"
 

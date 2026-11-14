@@ -7,7 +7,7 @@ use crate::connect::proto::{
     ConnectionDetails, Deployment, EndpointDescription, HmacBinding, NextStep, NodeDescription,
     Pairing as ProtoPairing, PairingClient, PairingCode,
 };
-use crate::connect::tls::{CapturedIdentity, TlsPolicy};
+use crate::connect::tls::{CapturedIdentity, Fingerprint, TlsPolicy};
 use crate::types::{ProtocolVersion, Timestamp};
 
 use super::http::{Error, Http};
@@ -27,24 +27,30 @@ const FINALIZE_PAIRING: &str = "finalizePairing";
 pub struct Paired {
     /// Everything the protocol agreed: who, where, and with which first access token.
     pub pairing: ProtoPairing,
-    /// The certificate chain the server presented during pairing.
+    /// The certificate chain the server presented during a **LAN** pairing.
     ///
     /// For a LAN endpoint this is what the specification tells you to pin:
     /// `S2C §4` — "The client **must** pin the self-signed CA (root) certificate, and
-    /// trust this certificate for the remainder of the pairing relation." Persist
-    /// [`CapturedIdentity::root`] beside the access token; without it, every later
-    /// connection to this device is unauthenticated.
+    /// trust this certificate for the remainder of the pairing relation."
     pub identity: Option<CapturedIdentity>,
 }
 
 impl Paired {
+    /// The certificate every later connection to this peer is pinned to, if any.
+    ///
+    /// The CA captured during a LAN pairing, whose leaf the challenge response verified.
+    /// `None` for a WAN peer, which the public PKI vouches for. Persist it beside the
+    /// access token: 32 bytes, and without it every later connection to this device is
+    /// unauthenticated.
+    #[must_use]
+    pub fn pin(&self) -> Option<Fingerprint> {
+        self.identity.as_ref().map(|identity| identity.root)
+    }
+
     /// The TLS policy every later connection to this peer should use.
     #[must_use]
     pub fn policy(&self) -> TlsPolicy {
-        match &self.identity {
-            Some(identity) => TlsPolicy::PinnedCa(identity.root.clone()),
-            None => TlsPolicy::Web,
-        }
+        self.pin().map_or(TlsPolicy::Web, TlsPolicy::Pinned)
     }
 }
 
@@ -59,7 +65,7 @@ impl Paired {
 /// // Whatever the end user typed, and wherever they typed the URL from.
 /// let code = PairingCode::parse("evse7-A1b2C3", TokenKind::Static)?;
 ///
-/// let paired = Pairing::lan("https://EVSE1038.local/v1/", me, EndpointDescription::default())?
+/// let paired = Pairing::lan("https://EVSE1038.local/", me, EndpointDescription::default())?
 ///     .run(code, Timestamp::now())
 ///     .await?;
 ///
@@ -79,6 +85,8 @@ pub struct Pairing {
     domain: Option<String>,
     s2_message_versions: Option<Vec<ProtocolVersion>>,
     force: bool,
+    /// Read before every step, so the fifteen-second budget is measured, not assumed.
+    clock: fn() -> Timestamp,
 }
 
 impl Pairing {
@@ -107,6 +115,7 @@ impl Pairing {
             domain: None,
             s2_message_versions: None,
             force: false,
+            clock: Timestamp::now,
         })
     }
 
@@ -135,6 +144,7 @@ impl Pairing {
             domain: Some(domain),
             s2_message_versions: None,
             force: false,
+            clock: Timestamp::now,
         })
     }
 
@@ -152,9 +162,19 @@ impl Pairing {
         self
     }
 
+    /// Use a different clock for the budget checks between steps — a virtual one, in a
+    /// test.
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> Timestamp) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Run the whole attempt: four requests, or three plus a push.
     ///
-    /// `now` starts the fifteen-second budget. Entropy is drawn from the operating system;
+    /// `now` starts the fifteen-second budget; every later step reads the clock again, so
+    /// an attempt that runs past the budget on this side fails here as it already has on
+    /// the server (`S2C §Interruption`). Entropy is drawn from the operating system;
     /// [`Self::run_with_entropy`] takes it as a parameter for a test that needs it pinned.
     pub async fn run(&self, code: PairingCode, now: Timestamp) -> Result<Paired, Error> {
         let mut nonce = [0u8; 32];
@@ -203,7 +223,7 @@ impl Pairing {
                 .map(|id| id.as_str().to_string())
                 .unwrap_or_default()
         };
-        match self.finish(&mut machine, accepted, now, own_details).await {
+        match self.finish(&mut machine, accepted, own_details).await {
             Ok(paired) => Ok(paired),
             Err(e) => {
                 let bearer = bearer_of(&machine);
@@ -225,7 +245,6 @@ impl Pairing {
         &self,
         machine: &mut PairingClient,
         accepted: crate::connect::proto::PairingAccepted,
-        now: Timestamp,
         own_details: Option<ConnectionDetails>,
     ) -> Result<Paired, Error> {
         // The handshake has happened, so in a LAN we now know `F`. Supplying it here —
@@ -244,8 +263,9 @@ impl Pairing {
 
         crate::trace::event!(debug, binding = ?binding, "checking the server's response");
 
-        // Steps 4 and 5.
-        let next = machine.accept(accepted, binding, self.deployment, now)?;
+        // Steps 4 and 5. How the server was reached is the fallback for a server that
+        // does not state its own deployment.
+        let next = machine.accept(accepted, binding, self.deployment, (self.clock)())?;
         crate::trace::event!(info, next = ?next, "the server authenticated");
         let bearer = machine
             .attempt_id()
@@ -265,7 +285,7 @@ impl Pairing {
                         &ask,
                     )
                     .await?;
-                machine.connection_details(details, now)?;
+                machine.connection_details(details, (self.clock)())?;
             }
             NextStep::PostConnectionDetails => {
                 let details = own_details.ok_or(Error::Protocol(
@@ -274,7 +294,7 @@ impl Pairing {
                         expected: "connection details to offer",
                     },
                 ))?;
-                let post = machine.post_connection_details(details, now)?;
+                let post = machine.post_connection_details(details, (self.clock)())?;
                 self.http
                     .post_empty(
                         "postConnectionDetails",
@@ -290,7 +310,7 @@ impl Pairing {
         if !self.http.tls().identity_is_stable() {
             return Err(Error::IdentityChanged);
         }
-        let (body, pairing) = machine.finalize(now)?;
+        let (body, pairing) = machine.finalize((self.clock)())?;
         crate::trace::event!(
             info,
             remote = %pairing.remote.id,

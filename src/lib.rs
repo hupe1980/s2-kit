@@ -1,6 +1,6 @@
 //! The S2 energy flexibility standard in Rust.
 //!
-//! S2 — formally **EN 50491-12-2**, on its way to becoming IEC 63402-2 — is the European
+//! S2 — formally **EN 50491-12-2**, internationally IEC 63402-2-2 — is the European
 //! standard for communicating energy flexibility between a **Customer Energy Manager**
 //! (CEM) and a **Resource Manager** (RM). The RM describes *how* a device can behave; the
 //! CEM decides *why* it should. The standard's own image is a menu: the RM writes it, the
@@ -74,7 +74,7 @@
 //! | `jiff` / `time` / `chrono` | [`Timestamp`] conversions, with the crate re-exported. |
 //! | `testing` | Fixtures, the two-engine harness, the in-memory pipe, and `.s2log` transcripts read as well as written. |
 //! | `schemars` | `JsonSchema` for this crate's own types, for the equivalence check. |
-//! | `tracing` | Structured events from the drivers: what crossed the wire, and what was refused. |
+//! | `tracing` | A span per session and an event per message from the drivers, keyed by `message_id`; never a payload. |
 //! | `cli` | The `s2-kit` command-line tool. |
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -171,7 +171,7 @@ pub use tokio;
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use tokio_tungstenite;
 
-// `TlsPolicy::PinnedCa` carries a `CertificateDer`, `TlsClient::config` an
+// `CapturedIdentity::chain` carries `CertificateDer`s, `TlsClient::config` an
 // `Arc<ClientConfig>`, `default_provider` an `Arc<CryptoProvider>`.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]

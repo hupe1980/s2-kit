@@ -59,8 +59,8 @@ pub use set::SessionSet;
 
 use crate::message::Message;
 use crate::message::MessageKind;
-use crate::types::Timestamp;
 use crate::types::common::ReceptionStatusValues;
+use crate::types::{ProtocolVersion, Timestamp};
 use crate::validate::Report;
 
 /// What both engines have in common: four calls in, three out, and a clock that is always
@@ -104,6 +104,9 @@ pub trait Session {
     /// Where the session has got to.
     fn state(&self) -> &SessionState;
 
+    /// The version string the handshake settled on, once it has.
+    fn negotiated_version(&self) -> Option<&ProtocolVersion>;
+
     /// Everything the session has learned about its peer.
     fn registry(&self) -> &Registry;
 
@@ -146,6 +149,9 @@ macro_rules! impl_session {
             fn state(&self) -> &SessionState {
                 <$ty>::state(self)
             }
+            fn negotiated_version(&self) -> Option<&ProtocolVersion> {
+                <$ty>::negotiated_version(self)
+            }
             fn registry(&self) -> &Registry {
                 <$ty>::registry(self)
             }
@@ -167,6 +173,12 @@ impl_session!(CemSession, CemEvent);
 pub struct Inbound {
     /// What the message claimed to be, where that could be read at all.
     pub kind: Option<MessageKind>,
+    /// The message's own `message_id`, where it had a readable one.
+    ///
+    /// `None` for a `ReceptionStatus`, which has no identifier of its own, and for a frame
+    /// too broken to read one from. It is the key that joins an operator's log line, the
+    /// `ReceptionStatus` this side sent, and the peer's own record of the exchange.
+    pub message_id: Option<crate::types::Id>,
     /// The reception status that was queued in reply.
     pub status: ReceptionStatusValues,
     /// Everything the validator found, errors and warnings alike.
@@ -174,9 +186,10 @@ pub struct Inbound {
 }
 
 impl Inbound {
-    pub(crate) fn ignored(kind: MessageKind) -> Self {
+    pub(crate) fn ignored(kind: MessageKind, message_id: Option<crate::types::Id>) -> Self {
         Self {
             kind: Some(kind),
+            message_id,
             status: ReceptionStatusValues::Ok,
             report: Report::new(),
         }

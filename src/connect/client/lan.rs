@@ -27,7 +27,8 @@ pub struct LanClient {
 }
 
 impl LanClient {
-    /// Point at an endpoint's versioned base URL.
+    /// Point at an endpoint's base URL — unversioned, as DNS-SD advertises it; the
+    /// version is read from its index on the first request.
     ///
     /// The certificate is self-signed and unverified, exactly as during pairing — and
     /// nothing this client returns is authenticated. It is material for a user interface,
@@ -92,8 +93,8 @@ impl LanClient {
     /// socket, nothing for a CEM to dial — takes part in a pairing at all: it asks the
     /// other endpoint what to do, and the answer arrives whenever a person presses a
     /// button there. The server holds the request for up to
-    /// [`LONG_POLL_HOLD`](crate::connect::proto::LONG_POLL_HOLD) and then answers with an
-    /// empty list; that is not an error, it is "nothing yet, ask again".
+    /// [`LONG_POLL_HOLD`](crate::connect::proto::LONG_POLL_HOLD) and then answers `204`,
+    /// read here as an empty list; that is not an error, it is "nothing yet, ask again".
     ///
     /// `S2C §Long-polling`: "the client can represent multiple nodes so the request body
     /// and the response contains a list", and the server "may only provide at most one
@@ -118,8 +119,10 @@ impl LanClient {
         &self,
         nodes: &[WaitForPairing],
     ) -> Result<Vec<WaitInstruction>, Error> {
-        self.long_poll
-            .post("waitForPairing", "waitForPairing", None, &nodes)
-            .await
+        Ok(self
+            .long_poll
+            .post_or_no_content("waitForPairing", "waitForPairing", None, &nodes)
+            .await?
+            .unwrap_or_default())
     }
 }

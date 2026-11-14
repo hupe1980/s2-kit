@@ -38,11 +38,21 @@ mod tls_error;
 mod ws;
 
 pub use longpoll::WaitingNode;
-pub use pairing::PairingService;
+pub use pairing::{CommunicationServer, Finalized, PairingService};
 pub use routes::{Endpoint, MAX_BODY_BYTES, PrepareSignal, lan_router, router};
-pub use session::SessionService;
-pub use store::{Memory, PairedNode, Store};
+pub use session::{LiveSession, SessionService};
+pub use store::{DYNAMIC_TOKEN_LIFETIME, Memory, PairedNode, PairingKey, Store};
 pub use subnet::{LocalSubnets, same_subnet};
-pub use tls::serve;
+pub use tls::{HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, serve};
 pub use tls_error::Error;
 pub use ws::{ServerSocket, websocket_router};
+
+/// Fill a buffer from the operating system's CSPRNG.
+///
+/// Every secret this endpoint mints — attempt ids, challenges, access tokens,
+/// communication tokens — comes from here. A failure means the system has no entropy
+/// source, which is not something to paper over with a weaker generator.
+pub(crate) fn fill_random(buffer: &mut [u8]) -> Result<(), rand::rngs::SysError> {
+    use rand::TryRng as _;
+    rand::rngs::SysRng.try_fill_bytes(buffer)
+}

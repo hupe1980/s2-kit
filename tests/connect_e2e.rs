@@ -28,10 +28,10 @@ use std::sync::Arc;
 use s2_kit::connect::client::{Pairing, Session};
 use s2_kit::connect::proto::*;
 use s2_kit::connect::server::{
-    Endpoint, LocalSubnets, Memory, PairingService, SessionService, Store, lan_router, router,
-    serve, websocket_router,
+    CommunicationServer, Endpoint, LocalSubnets, Memory, PairingKey, PairingService,
+    SessionService, Store, lan_router, router, serve, websocket_router,
 };
-use s2_kit::connect::tls::SelfSignedEndpoint;
+use s2_kit::connect::tls::{Fingerprint, SelfSignedEndpoint};
 use s2_kit::io::Driver;
 use s2_kit::prelude::{CemConfig, CemSession, MessageKind, RmConfig, RmEvent, RmSession};
 use s2_kit::types::Timestamp;
@@ -57,6 +57,10 @@ fn node(id: &str, role: Role, model: &str) -> NodeDescription {
     }
 }
 
+fn key(local: NodeId, remote: NodeId) -> PairingKey {
+    PairingKey { local, remote }
+}
+
 fn endpoint_description(deployment: Deployment) -> EndpointDescription {
     EndpointDescription {
         name: Some("Acme home hub".into()),
@@ -75,7 +79,9 @@ async fn start() -> Harness {
         .await
         .expect("a loopback port");
     let port = listener.local_addr().expect("a bound address").port();
-    let base_url = format!("https://localhost:{port}/v1/");
+    // Unversioned, as a DNS-SD `pairingUrl` and an `initiateSessionUrl` are: every client
+    // reads the version index here first.
+    let base_url = format!("https://localhost:{port}/");
 
     let store = Memory::new();
     let cem = node("cem-1", Role::Cem, "Home hub");
@@ -83,18 +89,14 @@ async fn start() -> Harness {
     store.add_node(cem, Some(NodeIdAlias::parse("hub7").unwrap()));
 
     // This CEM is in the LAN and so is the RM, which makes the CEM the communication
-    // server — so it is the side that hands out connection details.
-    let details = ConnectionDetails {
-        initiate_session_url: base_url.clone(),
-        access_token: AccessToken::from_entropy(&[7u8; 32]).unwrap(),
-        certificate_fingerprint: [("SHA256".to_string(), identity.leaf.to_hex())]
-            .into_iter()
-            .collect(),
-    };
-
+    // server — so it is the side that hands out connection details: where, and which CA.
+    // The access token is minted per pairing.
     let pairing = Arc::new(
         PairingService::lan(store.clone(), endpoint_description(Deployment::Lan), leaf)
-            .with_connection_details(details),
+            .as_communication_server(CommunicationServer {
+                initiate_session_url: base_url.clone(),
+                ca: Fingerprint::of(&identity.ca),
+            }),
     );
     let session = Arc::new(SessionService::new(
         store.clone(),
@@ -102,13 +104,15 @@ async fn start() -> Harness {
     ));
     let endpoint = Endpoint::new(pairing, session);
     // A LAN endpoint, so the LAN-only routes are mounted — behind the subnet check they
-    // require. The tests dial 127.0.0.1, and loopback is always local.
+    // require. The tests dial 127.0.0.1, so loopback is admitted explicitly.
     //
     // `/s2` is merged in as well, so the endpoint is a complete one: the token
     // `confirmAccessToken` hands out is a token something here will actually check.
     let app = lan_router(
         endpoint.clone(),
-        LocalSubnets::detect().expect("this host's interfaces"),
+        LocalSubnets::detect()
+            .expect("this host's interfaces")
+            .allowing_loopback(),
     )
     .merge(websocket_router(
         endpoint.clone(),
@@ -196,7 +200,7 @@ async fn a_lan_pairing_completes_over_real_tls() {
     assert_eq!(paired.pairing.remote.model_name, "Home hub");
     let stored = harness
         .store
-        .paired(paired.pairing.local)
+        .paired(key(harness.cem_node, paired.pairing.local))
         .expect("the server stored the pairing");
     assert_eq!(stored.remote.model_name, "Charger 9000");
 
@@ -210,7 +214,17 @@ async fn a_lan_pairing_completes_over_real_tls() {
     assert!(paired.policy().authenticates());
     // The chain is leaf-then-CA, and what gets pinned is the CA.
     assert_eq!(identity.chain.len(), 2);
-    assert_eq!(identity.root, identity.chain[1]);
+    assert_eq!(identity.root, Fingerprint::of(&identity.chain[1]));
+    assert_eq!(paired.pin(), Some(identity.root));
+    // The server said which CA, in the spec's encoding, and it is the one we pinned.
+    assert_eq!(
+        paired.pairing.details.ca_fingerprint(),
+        Some(*identity.root.as_bytes())
+    );
+    assert!(
+        !paired.pairing.details.initiate_session_url.contains("/v1"),
+        "initiateSessionUrl \"does not include the version number\""
+    );
 
     let _ = harness.shutdown.send(());
 }
@@ -314,12 +328,12 @@ async fn the_communication_token_opens_exactly_one_websocket() {
     assert_eq!(harness.endpoint.session().pending_connections(), 1);
 
     // The real one does, once — and identifies which paired node is connecting.
-    let node = harness
+    let pairing = harness
         .endpoint
         .session()
         .authorize_connection(credentials.websocket_token.as_str(), Timestamp::now())
         .expect("the token the client was handed must open the door");
-    assert_eq!(node, paired.pairing.local);
+    assert_eq!(pairing, key(harness.cem_node, paired.pairing.local));
     // "Valid for a single connection": the second attempt is refused.
     assert!(
         harness
@@ -347,7 +361,12 @@ async fn the_communication_token_opens_exactly_one_websocket() {
         .await
         .expect("a second initiation");
     let token = credentials.websocket_token.as_str().to_string();
-    let socket = s2_kit::io::WebSocket::connect(&format!("{ws_base}/s2"), Some(&token))
+    // Plain `ws://` on purpose — this half tests the route, not TLS — so the bearer has
+    // to be let through explicitly: by default it never crosses an unencrypted socket.
+    let plaintext = s2_kit::io::WebSocketOptions::default()
+        .bearer(&token)
+        .allow_insecure_bearer();
+    let socket = s2_kit::io::WebSocket::open(&format!("{ws_base}/s2"), &plaintext)
         .await
         .expect("the communication token must open the socket");
 
@@ -380,10 +399,16 @@ async fn the_communication_token_opens_exactly_one_websocket() {
 
     // And the token is spent: the same one will not open a second socket.
     assert!(
-        s2_kit::io::WebSocket::connect(&format!("{ws_base}/s2"), Some(&token))
+        s2_kit::io::WebSocket::open(&format!("{ws_base}/s2"), &plaintext)
             .await
             .is_err(),
         "a communication token is valid for a single connection"
+    );
+    // Without the opt-in, the bearer never leaves over plaintext at all.
+    assert!(
+        s2_kit::io::WebSocket::connect(&format!("{ws_base}/s2"), Some(&token))
+            .await
+            .is_err()
     );
 
     let _ = harness.shutdown.send(());
@@ -500,7 +525,7 @@ async fn a_resource_manager_pairs_with_one_energy_manager_at_a_time() {
     let config = identity.server_config().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base_url = format!("https://localhost:{port}/v1/");
+    let base_url = format!("https://localhost:{port}/");
 
     let store = Memory::new();
     let rm = node("rm-1", Role::Rm, "Charger 9000");
@@ -546,13 +571,11 @@ async fn a_resource_manager_pairs_with_one_energy_manager_at_a_time() {
         .unwrap();
         // Both LAN, so the CEM is the communication server and is the side that posts
         // where to connect.
-        let own_details = ConnectionDetails {
-            initiate_session_url: format!("https://localhost:{port}/v1/"),
-            access_token: AccessToken::from_entropy(&[9u8; 32]).unwrap(),
-            certificate_fingerprint: [("SHA256".to_string(), leaf.to_hex())]
-                .into_iter()
-                .collect(),
-        };
+        let own_details = ConnectionDetails::new(
+            format!("https://localhost:{port}/"),
+            AccessToken::from_entropy(&[9u8; 32]).unwrap(),
+        )
+        .with_ca_fingerprint(&[0xCA; 32]);
         let paired = client
             .run_with_entropy(
                 PairingCode::parse("evse1-A1b2C3d4", TokenKind::Static).unwrap(),
@@ -566,16 +589,24 @@ async fn a_resource_manager_pairs_with_one_energy_manager_at_a_time() {
     }
 
     // Exactly one survives, and it is the most recent.
-    let remaining = store.paired_with(rm_node);
+    let remaining = store.pairings_of(rm_node);
     assert_eq!(
         remaining.len(),
         1,
         "a Resource Manager must not stay paired with two managers: {remaining:?}"
     );
-    assert_eq!(remaining[0], paired_ids[1]);
+    assert_eq!(remaining[0], key(rm_node, paired_ids[1]));
     assert!(
-        store.paired(paired_ids[0]).is_none(),
+        store.paired(key(rm_node, paired_ids[0])).is_none(),
         "the first CEM is gone"
+    );
+    // And the one that stayed knows which CA to pin when it dials the CEM (6B).
+    assert_eq!(
+        store
+            .paired(key(rm_node, paired_ids[1]))
+            .and_then(|p| p.pin())
+            .map(|pin| *pin.as_bytes()),
+        Some([0xCA; 32])
     );
 
     let _ = shutdown.send(());
@@ -614,7 +645,7 @@ async fn the_wrong_pairing_code_is_refused_and_costs_a_second() {
     assert!(
         harness
             .store
-            .paired(NodeId::parse("rm-1").unwrap())
+            .paired(key(harness.cem_node, NodeId::parse("rm-1").unwrap()))
             .is_none()
     );
 
@@ -792,7 +823,7 @@ async fn a_wan_router_does_not_serve_the_lan_only_routes_at_all() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let base = format!("https://localhost:{port}/v1/");
+    let base = format!("https://localhost:{port}/");
     let client = s2_kit::connect::client::LanClient::new(&base).unwrap();
     for outcome in [client.endpoint().await.err(), client.nodes().await.err()] {
         let Some(s2_kit::connect::client::Error::Http { status, .. }) = outcome else {
@@ -987,7 +1018,12 @@ async fn unpairing_makes_the_tokens_stop_working() {
         .expect("one session");
 
     session.unpair().await.expect("unpairing");
-    assert!(harness.store.paired(paired.pairing.local).is_none());
+    assert!(
+        harness
+            .store
+            .paired(key(harness.cem_node, paired.pairing.local))
+            .is_none()
+    );
     assert!(session.tokens().is_empty());
 
     let _ = harness.shutdown.send(());
@@ -1100,7 +1136,7 @@ async fn an_endpoint_cannot_answer_a_pairing_request_with_a_gigabyte() {
     let config = identity.server_config().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base_url = format!("https://localhost:{port}/v1/");
+    let base_url = format!("https://localhost:{port}/");
 
     // A "server" that answers every S2 Connect path with a body far past the cap. Valid
     // JSON, 200 OK, and four megabytes of it.
@@ -1108,7 +1144,10 @@ async fn an_endpoint_cannot_answer_a_pairing_request_with_a_gigabyte() {
         let filler = "x".repeat(4 * 1024 * 1024);
         axum::Json(serde_json::json!({ "pairingAttemptId": filler }))
     };
+    // The version index first: it is the first thing a client reads, so it is the first
+    // thing a hostile endpoint gets to flood.
     let app = axum::Router::new()
+        .route("/", get(flood))
         .route("/v1/requestPairing", post(flood))
         .route("/v1/nodes", get(flood));
     let (shutdown, rx) = tokio::sync::oneshot::channel();
@@ -1184,5 +1223,160 @@ async fn a_failed_pairing_releases_the_attempt_instead_of_holding_it() {
         "the next attempt must not be blocked by the abandoned one: {paired:?}"
     );
 
+    let _ = harness.shutdown.send(());
+}
+
+/// Pair as one Resource Manager, and come back with a session client for it.
+async fn pair_rm(harness: &Harness, id: &str) -> (s2_kit::connect::client::Paired, Session) {
+    harness.store.open_for_pairing(
+        harness.cem_node,
+        PairingToken::parse("A1b2C3d4", TokenKind::Static).unwrap(),
+    );
+    let paired = Pairing::lan(
+        &harness.base_url,
+        node(id, Role::Rm, "Charger 9000"),
+        endpoint_description(Deployment::Lan),
+    )
+    .unwrap()
+    .run(
+        PairingCode::parse("hub7-A1b2C3d4", TokenKind::Static).unwrap(),
+        Timestamp::now(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{id} must pair: {e}"));
+    let session = Session::new(
+        &paired.pairing.details.initiate_session_url,
+        &paired.policy(),
+        paired.pairing.local,
+        paired.pairing.remote.id,
+        TokenStore::new(paired.pairing.details.access_token.clone()),
+    )
+    .unwrap();
+    (paired, session)
+}
+
+/// `S2C §8A`: "The server **must** generate an access token for the HTTPS client … by a
+/// cryptographically secure pseudorandom number generator." One token for everyone would
+/// let any paired client open a session as any other.
+#[tokio::test]
+async fn every_pairing_gets_its_own_access_token_and_cannot_use_anothers() {
+    let harness = start().await;
+    let (first, _) = pair_rm(&harness, "rm-1").await;
+    // The per-node rate limit is real, and `finalizePairing` starts its second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (second, _) = pair_rm(&harness, "rm-2").await;
+
+    let (a, b) = (
+        &first.pairing.details.access_token,
+        &second.pairing.details.access_token,
+    );
+    assert!(!a.verify(b), "two pairings, two access tokens");
+
+    // rm-1's token presented as rm-2 is refused: the token belongs to a pairing, not to
+    // the endpoint.
+    let mut impostor = Session::new(
+        &first.pairing.details.initiate_session_url,
+        &first.policy(),
+        second.pairing.local,
+        second.pairing.remote.id,
+        TokenStore::new(a.clone()),
+    )
+    .unwrap();
+    assert!(impostor.initiate(Timestamp::now()).await.is_err());
+
+    // Both pairings are stored side by side under the same CEM.
+    let mut pairings = harness.store.pairings_of(harness.cem_node);
+    pairings.sort();
+    assert_eq!(pairings.len(), 2);
+
+    let _ = harness.shutdown.send(());
+}
+
+/// `S2C §Termination`: "After two nodes have unpaired, the S2 WebSocket connection
+/// **MUST** be terminated immediately." And `S2C §Unpairing by the communication server`:
+/// "The next … initiateSession HTTPS API request **must** fail with the `No longer paired`
+/// response."
+#[tokio::test]
+async fn unpairing_from_the_server_ends_the_live_session_and_says_so_next_time() {
+    let harness = start().await;
+    let (paired, mut session) = pair_rm(&harness, "rm-1").await;
+    let credentials = session.initiate(Timestamp::now()).await.unwrap();
+    let socket = s2_kit::io::WebSocket::connect_with_policy(
+        &credentials.websocket_url,
+        Some(credentials.websocket_token.as_str()),
+        &paired.policy(),
+    )
+    .await
+    .expect("the session opens");
+
+    let mut rm = RmSession::new(
+        RmConfig::default().pre_negotiated(s2_kit::types::WireProfile::V1_0_0),
+        s2_kit::testing::battery_details(),
+    );
+    rm.open(Timestamp::now());
+    let mut driver = Driver::new(socket);
+    let pairing = key(harness.cem_node, paired.pairing.local);
+    // Until the server has registered the socket, there is nothing to end.
+    for _ in 0..50 {
+        if harness.endpoint.session().live_sessions(pairing) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(harness.endpoint.session().live_sessions(pairing), 1);
+
+    harness.endpoint.session().unpair_remote(pairing);
+
+    // The RM sees its transport close, promptly.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let _ = driver.step(&mut rm).await;
+            if rm.state().is_closed() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the WebSocket was not terminated");
+
+    // And the next initiation is told, by name, that the pairing is gone.
+    let error = session
+        .initiate(Timestamp::now())
+        .await
+        .expect_err("a revoked pairing does not open sessions");
+    assert!(
+        matches!(
+            &error,
+            s2_kit::connect::client::Error::Protocol(ConnectError::SessionRefused(refused))
+                if refused.error_message == SessionErrorMessage::NoLongerPaired
+        ),
+        "{error:?}"
+    );
+    assert!(
+        session.tokens().is_empty(),
+        "\"Do not retry\": the tokens are dropped"
+    );
+    assert!(
+        harness.store.paired(pairing).is_none(),
+        "told once, then forgotten"
+    );
+
+    let _ = harness.shutdown.send(());
+}
+
+#[tokio::test]
+async fn the_version_index_is_served_where_the_base_url_points() {
+    // `S2C §Versioning of OpenAPI files`: the server "**must** always … serve an index …
+    // which returns a JSON array containing the versions of the API that it supports".
+    // The pairing above already depends on it — the client reads it before its first
+    // operation — so this pins the body itself.
+    let harness = start().await;
+    let client = s2_kit::connect::client::LanClient::new(&harness.base_url).unwrap();
+    // Any operation forces the index read; `GET /v1/endpoint` is the cheapest.
+    let described = client
+        .endpoint()
+        .await
+        .expect("index read, then the operation");
+    assert_eq!(described.deployment, Some(Deployment::Lan));
     let _ = harness.shutdown.send(());
 }

@@ -8,7 +8,7 @@ Everything in this directory is a verbatim copy of
 2.0** — see `LICENSE`, which is upstream's own copy. It is **not** covered
 by this crate's `MIT OR Apache-2.0`.
 
-Vendored from revision `d58b2f027c7b40374e8d57aee72d1876ed9e0763`.
+Vendored from tag `v1.0.0`, commit `d58b2f027c7b40374e8d57aee72d1876ed9e0763`.
 
 | Path | What |
 |---|---|
@@ -62,7 +62,7 @@ rather than three hundred of JSON. They are used by
 `tests/model_matches_schema.rs`, which validates every message against them
 with a real JSON Schema validator, and by `cargo xtask gen-schema-table`.
 
-To refresh them, clone `s2-json` into `specs/` (gitignored, and it must not
-be a shallow clone — the `v0.0.2-beta` tag is read from git history) and run
-`cargo xtask vendor-specs`. CI fails if the result differs from what is
-committed.
+To refresh them, clone `s2-json` into the directory `$S2_REFERENCE` names
+(it must not be a shallow clone — the `v0.0.2-beta` tag is read from git
+history) and run `cargo xtask vendor-specs`. CI fails if the result differs
+from what is committed.

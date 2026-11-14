@@ -125,10 +125,11 @@ pub struct PrepareRefused {
 
 /// How long a long-polling server may hold a request open.
 ///
-/// `S2C §Long-polling`: the server answers "just before the request would time out". The
-/// client's own timeout must be longer than this, or it will abandon requests the server
-/// was about to answer.
-pub const LONG_POLL_HOLD: crate::types::Duration = crate::types::Duration::from_secs(25);
+/// `S2C §Long-polling`: "The server **must** always respond within 25 seconds." Twenty,
+/// so that the hold plus the time to build and send the answer stays inside the deadline
+/// rather than on it. The client's own timeout must be longer than this, or it will
+/// abandon requests the server was about to answer.
+pub const LONG_POLL_HOLD: crate::types::Duration = crate::types::Duration::from_secs(20);
 
 /// How long a long-polling client should wait before giving up on one request.
 pub const LONG_POLL_TIMEOUT: crate::types::Duration = crate::types::Duration::from_secs(30);

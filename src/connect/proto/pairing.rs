@@ -223,6 +223,53 @@ pub struct ConnectionDetails {
     pub certificate_fingerprint: BTreeMap<String, String>,
 }
 
+impl ConnectionDetails {
+    /// The key `S2C` requires in [`certificate_fingerprint`](Self::certificate_fingerprint).
+    ///
+    /// (The OpenAPI's description spells it `"SHA265"`; the prose and every
+    /// implementation spell it `SHA256` — erratum E31.)
+    pub const SHA256: &'static str = "SHA256";
+
+    /// Details with no fingerprint: what a communication server hands out in 7A, where the
+    /// client pins the CA it saw during pairing instead.
+    #[must_use]
+    pub fn new(initiate_session_url: impl Into<String>, access_token: AccessToken) -> Self {
+        Self {
+            initiate_session_url: initiate_session_url.into(),
+            access_token,
+            certificate_fingerprint: BTreeMap::new(),
+        }
+    }
+
+    /// Add the SHA-256 fingerprint of the CA, written the way `S2C` encodes it: plain
+    /// lowercase hexadecimal.
+    ///
+    /// Mandatory in 6B ("when the pairing client will become the communication server"),
+    /// harmless in 7A.
+    #[must_use]
+    pub fn with_ca_fingerprint(mut self, sha256: &[u8; 32]) -> Self {
+        use core::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for b in sha256 {
+            let _ = write!(hex, "{b:02x}");
+        }
+        self.certificate_fingerprint
+            .insert(String::from(Self::SHA256), hex);
+        self
+    }
+
+    /// The SHA-256 fingerprint of the CA, if one was given and it is 32 bytes of hex —
+    /// either case, with or without colons.
+    #[must_use]
+    pub fn ca_fingerprint(&self) -> Option<[u8; 32]> {
+        let hex = self.certificate_fingerprint.get(Self::SHA256)?;
+        match super::HmacBinding::from_hex_fingerprint(hex).ok()? {
+            super::HmacBinding::LeafFingerprint(bytes) => bytes.try_into().ok(),
+            super::HmacBinding::DomainName(_) => None,
+        }
+    }
+}
+
 /// The body of `requestConnectionDetails` (6A).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,11 +508,17 @@ impl PairingClient {
     /// the challenge. So if the challenge succeeds, the certificate fingerprint is
     /// correct, and the certificate can be trusted. The client **must** pin the
     /// self-signed CA (root) certificate."
+    ///
+    /// `server_deployment` is how the server was reached — [`Deployment::Lan`] for a
+    /// `.local` endpoint, [`Deployment::Wan`] for one verified against the public PKI —
+    /// and is used only when the server's endpoint description omits its own. This
+    /// node's deployment is the one its own [`EndpointDescription`] states, LAN when it
+    /// states none.
     pub fn accept(
         &mut self,
         accepted: PairingAccepted,
         binding: HmacBinding,
-        local_deployment: Deployment,
+        server_deployment: Deployment,
         now: Timestamp,
     ) -> Result<NextStep, ConnectError> {
         self.expect(PairingStep::AwaitingAcceptance)?;
@@ -500,7 +553,8 @@ impl PairingClient {
         let server_deployment = accepted
             .server_endpoint_description
             .deployment
-            .unwrap_or(Deployment::Lan);
+            .unwrap_or(server_deployment);
+        let local_deployment = self.local_endpoint.deployment.unwrap_or(Deployment::Lan);
         let (cem, rm) = if self.local.role == Role::Cem {
             (local_deployment, server_deployment)
         } else {
@@ -548,6 +602,14 @@ impl PairingClient {
         details: ConnectionDetails,
         now: Timestamp,
     ) -> Result<ConnectionDetailsPost, ConnectError> {
+        // "The key `SHA256` must always be provided": without it the pairing server, which
+        // is about to become our communication client, has nothing to pin.
+        if details.ca_fingerprint().is_none() {
+            return Err(ConnectError::OutOfOrder {
+                got: "connection details without a SHA256 CA fingerprint",
+                expected: "certificateFingerprint.SHA256",
+            });
+        }
         let response = self.server_challenge_response()?;
         self.connection_details(details.clone(), now)?;
         Ok(ConnectionDetailsPost {
@@ -661,6 +723,10 @@ struct Attempt {
     s2_message_versions: Vec<ProtocolVersion>,
     details: Option<ConnectionDetails>,
     verified: bool,
+    /// Whether the *client* will be the communication server — 6B — rather than this
+    /// node — 6A. Decided from the two deployments when the attempt starts, so a client
+    /// that takes the other branch is refused rather than obeyed.
+    client_is_communication_server: bool,
 }
 
 impl PairingServer {
@@ -797,6 +863,19 @@ impl PairingServer {
             server_hmac_challenge: super::base64_encode(server_challenge),
         };
 
+        let client_deployment = request
+            .client_endpoint_description
+            .deployment
+            .unwrap_or(Deployment::Lan);
+        let own_deployment = self.local_endpoint.deployment.unwrap_or(Deployment::Lan);
+        let (cem, rm) = if self.local.role == Role::Cem {
+            (own_deployment, client_deployment)
+        } else {
+            (client_deployment, own_deployment)
+        };
+        let client_is_communication_server =
+            Deployment::communication_server(cem, rm) == request.client_node_description.role;
+
         self.attempt = Some(Attempt {
             id: attempt_id,
             started: now,
@@ -806,6 +885,7 @@ impl PairingServer {
             s2_message_versions: common,
             details: None,
             verified: false,
+            client_is_communication_server,
         });
         let send_after = now.checked_add(MINIMUM_SERVER_DELAY).unwrap_or(now);
         self.pending = Some((send_after, accepted.clone()));
@@ -870,28 +950,76 @@ impl PairingServer {
         Ok(())
     }
 
+    /// Whether this attempt's client is to be the communication server (6B), if an
+    /// attempt is in flight.
+    #[must_use]
+    pub fn client_is_communication_server(&self) -> Option<bool> {
+        self.attempt
+            .as_ref()
+            .map(|a| a.client_is_communication_server)
+    }
+
     /// Step 7A: what to answer `requestConnectionDetails` with, once verified.
+    ///
+    /// Refused — and the attempt failed — when the client is the one that should be the
+    /// communication server: `S2C §Invalid interactions`, "If the server receives a wrong
+    /// HTTPS request (e.g. `/postConnectionDetails` while it was expecting
+    /// `/requestConnectionDetails`) … it **must** respond with a status 400 and consider
+    /// the pairing attempt as failed."
     pub fn connection_details(
         &mut self,
         details: ConnectionDetails,
+        now: Timestamp,
     ) -> Result<ConnectionDetails, ConnectError> {
-        let attempt = self.attempt.as_mut().ok_or(ConnectError::OutOfOrder {
-            got: "connection details",
-            expected: "the start of pairing",
-        })?;
-        if !attempt.verified {
-            return Err(ConnectError::ChallengeFailed);
-        }
-        attempt.details = Some(details.clone());
-        Ok(details)
+        self.record_details(details, false, now)
     }
 
     /// Step 7B: record the details the client posted, once verified.
+    ///
+    /// Refused — and the attempt failed — when this node should be the communication
+    /// server, or when the details carry no `SHA256` CA fingerprint to pin.
     pub fn accept_connection_details(
         &mut self,
         details: ConnectionDetails,
+        now: Timestamp,
     ) -> Result<(), ConnectError> {
-        self.connection_details(details).map(|_| ())
+        if details.ca_fingerprint().is_none() {
+            self.fail(now);
+            return Err(refused(PairingErrorMessage::ParsingError));
+        }
+        self.record_details(details, true, now).map(|_| ())
+    }
+
+    fn record_details(
+        &mut self,
+        details: ConnectionDetails,
+        posted_by_client: bool,
+        now: Timestamp,
+    ) -> Result<ConnectionDetails, ConnectError> {
+        let (verified, client_is_server) = self
+            .attempt
+            .as_ref()
+            .map(|a| (a.verified, a.client_is_communication_server))
+            .ok_or(ConnectError::OutOfOrder {
+                got: "connection details",
+                expected: "the start of pairing",
+            })?;
+        if !verified {
+            return Err(ConnectError::ChallengeFailed);
+        }
+        if client_is_server != posted_by_client {
+            let (got, expected) = if posted_by_client {
+                ("postConnectionDetails", "requestConnectionDetails")
+            } else {
+                ("requestConnectionDetails", "postConnectionDetails")
+            };
+            self.fail(now);
+            return Err(ConnectError::OutOfOrder { got, expected });
+        }
+        if let Some(attempt) = self.attempt.as_mut() {
+            attempt.details = Some(details.clone());
+        }
+        Ok(details)
     }
 
     /// Step 8: handle `finalizePairing`, yielding the pairing to store.
@@ -1003,11 +1131,11 @@ mod tests {
     }
 
     fn details() -> ConnectionDetails {
-        ConnectionDetails {
-            initiate_session_url: "https://pairing.example.com/v1/".to_string(),
-            access_token: AccessToken::from_entropy(&[1u8; 32]).expect("32 bytes"),
-            certificate_fingerprint: BTreeMap::new(),
-        }
+        ConnectionDetails::new(
+            "https://pairing.example.com/",
+            AccessToken::from_entropy(&[1u8; 32]).expect("32 bytes"),
+        )
+        .with_ca_fingerprint(&[0xCA; 32])
     }
 
     fn t(secs: i64) -> Timestamp {
@@ -1083,7 +1211,7 @@ mod tests {
             .verify_client(&post.server_hmac_challenge_response, t(1))
             .unwrap();
         server
-            .accept_connection_details(post.connection_details)
+            .accept_connection_details(post.connection_details, t(1))
             .unwrap();
 
         // 8.
@@ -1125,11 +1253,101 @@ mod tests {
         server
             .verify_client(&ask.server_hmac_challenge_response, t(1))
             .unwrap();
-        let given = server.connection_details(details()).unwrap();
+        let given = server.connection_details(details(), t(1)).unwrap();
         client.connection_details(given, t(1)).unwrap();
         let (body, pairing) = client.finalize(t(2)).unwrap();
         assert_eq!(pairing.communication_server, Role::Rm);
         assert!(server.finalize(body, t(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_server_that_omits_its_deployment_is_taken_to_be_where_it_was_reached() {
+        // A LAN CEM pairing with a WAN RM that leaves `deployment` out. Defaulting the
+        // absent value to LAN made the CEM the communication server and the client posted
+        // details the server never asked for — the WAN node is the server
+        // (`S2C §Mapping`), and the client reached it as one.
+        let outcome = |reached: Deployment| {
+            let Run {
+                mut client,
+                mut server,
+            } = setup(Role::Cem, Deployment::Lan, Deployment::Wan);
+            let request = client.request_pairing(&CLIENT_CHALLENGE).unwrap();
+            let (_, mut accepted) = server
+                .request_pairing(
+                    &request,
+                    &code().token,
+                    &SERVER_CHALLENGE,
+                    attempt_id(),
+                    t(0),
+                )
+                .unwrap();
+            accepted.server_endpoint_description.deployment = None;
+            client.accept(accepted, binding(), reached, t(1)).unwrap()
+        };
+        assert_eq!(outcome(Deployment::Wan), NextStep::RequestConnectionDetails);
+        assert_eq!(outcome(Deployment::Lan), NextStep::PostConnectionDetails);
+    }
+
+    #[test]
+    fn the_wrong_branch_of_step_six_fails_the_attempt() {
+        // `S2C §Invalid interactions`: "/postConnectionDetails while it was expecting
+        // /requestConnectionDetails … must respond with a status 400 and consider the
+        // pairing attempt as failed." Here the server is the WAN RM, so 6A is expected and
+        // a client that posts its own details instead is refused, and the attempt is over.
+        let Run {
+            mut client,
+            mut server,
+        } = setup(Role::Cem, Deployment::Lan, Deployment::Wan);
+        let request = client.request_pairing(&CLIENT_CHALLENGE).unwrap();
+        let (_, accepted) = server
+            .request_pairing(
+                &request,
+                &code().token,
+                &SERVER_CHALLENGE,
+                attempt_id(),
+                t(0),
+            )
+            .unwrap();
+        client
+            .accept(accepted, binding(), Deployment::Lan, t(1))
+            .unwrap();
+        let ask = client.request_connection_details().unwrap();
+        server
+            .verify_client(&ask.server_hmac_challenge_response, t(1))
+            .unwrap();
+        assert_eq!(server.client_is_communication_server(), Some(false));
+        assert!(matches!(
+            server.accept_connection_details(details(), t(1)),
+            Err(ConnectError::OutOfOrder { .. })
+        ));
+        assert!(
+            server.client_is_communication_server().is_none(),
+            "the attempt is failed, not merely refused"
+        );
+    }
+
+    #[test]
+    fn posted_details_without_a_ca_fingerprint_are_refused() {
+        // "The key `SHA256` must always be provided": without it the pairing server has
+        // nothing to pin when it becomes the communication client.
+        let bare = ConnectionDetails::new("https://cem.local/", AccessToken::new("x".repeat(43)));
+        assert!(bare.ca_fingerprint().is_none());
+        let pinned = bare.clone().with_ca_fingerprint(&[0xAB; 32]);
+        assert_eq!(pinned.ca_fingerprint(), Some([0xAB; 32]));
+        assert_eq!(
+            pinned
+                .certificate_fingerprint
+                .get("SHA256")
+                .map(String::as_str),
+            Some("ab".repeat(32).as_str()),
+            "plain lowercase hexadecimal on the wire"
+        );
+        // Colons and capitals are still read.
+        let mut colons = bare;
+        colons
+            .certificate_fingerprint
+            .insert("SHA256".to_string(), alloc::vec!["AB"; 32].join(":"));
+        assert_eq!(colons.ca_fingerprint(), Some([0xAB; 32]));
     }
 
     #[test]

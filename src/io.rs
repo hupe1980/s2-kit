@@ -88,11 +88,41 @@ pub trait TextTransport {
     ///
     /// Must be **cancel-safe**: see the trait's own documentation.
     fn recv_text(&mut self) -> impl Future<Output = Result<Option<String>, Error>> + Send;
+    /// Wait for one frame, reporting the ones that only prove the peer is alive — a pong,
+    /// a ping — as [`Received::Alive`].
+    ///
+    /// The driver's idle limit is measured on this, so a quiet session whose peer still
+    /// answers pings is not mistaken for a dead one. The default reports text only, which
+    /// is correct for a transport with no liveness frames; the WebSocket transports here
+    /// override it. Must be **cancel-safe**, like [`recv_text`](Self::recv_text).
+    fn recv(&mut self) -> impl Future<Output = Result<Option<Received>, Error>> + Send {
+        use futures_util::FutureExt as _;
+        self.recv_text()
+            .map(|frame| frame.map(|text| text.map(Received::Text)))
+    }
     /// Send a keep-alive, if the transport has one.
     fn ping(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
     /// Close.
     fn close(&mut self) -> impl Future<Output = ()> + Send;
 }
+
+/// One thing a [`TextTransport`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Received {
+    /// An S2 message.
+    Text(String),
+    /// A frame that carries nothing but proof the peer is there: a ping or a pong.
+    Alive,
+}
+
+/// How long a connection may go without a single frame from the peer — not a message, not
+/// a pong — before the driver treats it as gone.
+///
+/// A half-open TCP connection (a router rebooted, a cable pulled) sends nothing and
+/// reports nothing; without a limit the driver pings into it for ever and reconnection,
+/// which `S2C §Reconnection strategy` says the client "**must**" attempt, never starts.
+/// Three [`PING_INTERVAL`]s: one lost pong is weather, three are a dead link.
+pub const IDLE_LIMIT: Duration = Duration::from_secs(90);
 
 /// A WebSocket, as S2 Connect specifies it.
 pub struct WebSocket<S> {
@@ -137,9 +167,20 @@ pub struct WebSocketOptions<'a> {
     /// How to authenticate the server's certificate. `None` is
     /// [`TlsPolicy::Web`](crate::connect::tls::TlsPolicy::Web), the public PKI.
     pub policy: Option<&'a crate::connect::tls::TlsPolicy>,
+    /// Send the bearer over plaintext `ws://`. Off: a bearer is an S2 Connect
+    /// communication token, and `S2C §Encrypted connection` says "S2 **MUST NOT** be sent
+    /// over unencrypted channels". A bare-WebSocket peer with no bearer is unaffected.
+    pub allow_insecure_bearer: bool,
 }
 
 impl<'a> WebSocketOptions<'a> {
+    /// Permit a bearer over `ws://` — for a loopback test and nothing else.
+    #[must_use]
+    pub const fn allow_insecure_bearer(mut self) -> Self {
+        self.allow_insecure_bearer = true;
+        self
+    }
+
     /// With this bearer token.
     #[must_use]
     pub const fn bearer(mut self, bearer: &'a str) -> Self {
@@ -210,7 +251,14 @@ impl Dialled {
         }
         let web = TlsPolicy::Web;
         let policy = options.policy.unwrap_or(&web);
-        Self::dial(url, options.bearer, policy, options.limit()).await
+        Self::dial(
+            url,
+            options.bearer,
+            policy,
+            options.limit(),
+            options.allow_insecure_bearer,
+        )
+        .await
     }
 
     /// Connect under a [`TlsPolicy`](crate::connect::tls::TlsPolicy) — which, after a LAN
@@ -252,6 +300,7 @@ impl Dialled {
         bearer: Option<&str>,
         policy: &crate::connect::tls::TlsPolicy,
         max_message_bytes: usize,
+        allow_insecure_bearer: bool,
     ) -> Result<Self, Error> {
         let mut request = url
             .into_client_request()
@@ -270,6 +319,12 @@ impl Dialled {
         } else {
             None
         };
+        if bearer.is_some() && connector.is_none() && !allow_insecure_bearer {
+            return Err(Error::Transport(
+                "refusing to send a bearer token over plaintext ws:// (S2C §Encrypted connection)"
+                    .to_string(),
+            ));
+        }
         if let Some(token) = bearer {
             let value = alloc::format!("Bearer {token}")
                 .parse()
@@ -317,13 +372,29 @@ where
     #[allow(clippy::match_same_arms)] // grouped by reason; see the comments
     async fn recv_text(&mut self) -> Result<Option<String>, Error> {
         loop {
-            match self.stream.next().await {
+            match self.recv().await? {
                 None => return Ok(None),
+                Some(Received::Text(text)) => return Ok(Some(text)),
+                Some(Received::Alive) => {}
+            }
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Option<Received>, Error> {
+        loop {
+            match self.stream.next().await {
+                // The stream ended, or the peer said goodbye: the same thing to a session.
+                None | Some(Ok(WsMessage::Close(_))) => return Ok(None),
                 Some(Err(e)) => return Err(Error::Transport(e.to_string())),
-                Some(Ok(WsMessage::Text(text))) => return Ok(Some(text.to_string())),
-                Some(Ok(WsMessage::Close(_))) => return Ok(None),
-                // Ping and pong are handled by the library; a binary frame is not S2.
-                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
+                Some(Ok(WsMessage::Text(text))) => {
+                    return Ok(Some(Received::Text(text.to_string())));
+                }
+                // Answering a ping is the library's job; both prove the peer is there.
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {
+                    return Ok(Some(Received::Alive));
+                }
+                Some(Ok(WsMessage::Frame(_))) => {}
+                // A binary frame is not S2.
                 Some(Ok(WsMessage::Binary(_))) => {
                     return Err(Error::UnexpectedFrame("binary".to_string()));
                 }
@@ -362,6 +433,22 @@ pub struct Driver<T> {
     /// idle connection", it says an implementation "**must not** wait more than 60
     /// seconds between sending ping frames".
     last_ping: Option<Timestamp>,
+    /// When the peer was last heard from — any frame at all — or `None` before the first
+    /// step.
+    last_heard: Option<Timestamp>,
+    /// How long silence may last before the transport is treated as closed.
+    idle_limit: Option<Duration>,
+    /// The span every log line of this session is recorded in.
+    ///
+    /// One per driver, so per session: an operator filtering a fleet's logs by a resource
+    /// id set here sees that resource's conversation and nothing else. The state and the
+    /// negotiated version are recorded on it as they change, and each inbound message gets
+    /// a child span keyed by its `message_id` — the key the `ReceptionStatus` carries back.
+    #[cfg(feature = "tracing")]
+    span: tracing::Span,
+    /// The state last recorded on the span, so a transition is logged once.
+    #[cfg(feature = "tracing")]
+    recorded_state: Option<String>,
 }
 
 impl<T: TextTransport> Driver<T> {
@@ -372,13 +459,53 @@ impl<T: TextTransport> Driver<T> {
             ping_interval: PING_INTERVAL,
             now: Timestamp::now,
             last_ping: None,
+            last_heard: None,
+            idle_limit: Some(IDLE_LIMIT),
+            #[cfg(feature = "tracing")]
+            span: tracing::info_span!(
+                "s2.session",
+                state = tracing::field::Empty,
+                version = tracing::field::Empty,
+            ),
+            #[cfg(feature = "tracing")]
+            recorded_state: None,
         }
+    }
+
+    /// Record this session's log lines in `span` instead of the default `s2.session`.
+    ///
+    /// The way to put a resource id, a peer address or a tenant on every line:
+    ///
+    /// ```ignore
+    /// let driver = Driver::new(socket).with_span(tracing::info_span!(
+    ///     "s2.session",
+    ///     resource = %resource_id,
+    ///     state = tracing::field::Empty,
+    ///     version = tracing::field::Empty,
+    /// ));
+    /// ```
+    ///
+    /// Declare `state` and `version` as empty fields to have the driver fill them in;
+    /// `tracing` ignores a record of a field the span did not declare.
+    #[cfg(feature = "tracing")]
+    #[must_use]
+    pub fn with_span(mut self, span: tracing::Span) -> Self {
+        self.span = span;
+        self
     }
 
     /// Use a different clock — a virtual one, in a test.
     #[must_use]
     pub fn with_clock(mut self, now: fn() -> Timestamp) -> Self {
         self.now = now;
+        self
+    }
+
+    /// Treat the transport as closed after this long without a frame from the peer, or
+    /// never (`None`). Defaults to [`IDLE_LIMIT`]; keep it a few ping intervals long.
+    #[must_use]
+    pub fn with_idle_limit(mut self, limit: Option<Duration>) -> Self {
+        self.idle_limit = limit;
         self
     }
 
@@ -400,6 +527,35 @@ impl<T: TextTransport> Driver<T> {
     /// interval}, feed the result back in, flush again. Everything that decides anything
     /// is in the session; this function decides only what to wait on.
     pub async fn step<S: Session>(&mut self, session: &mut S) -> Result<(), Error> {
+        #[cfg(feature = "tracing")]
+        {
+            use tracing::Instrument as _;
+            let span = self.span.clone();
+            let result = self.step_inner(session).instrument(span).await;
+            self.record_state(session);
+            result
+        }
+        #[cfg(not(feature = "tracing"))]
+        self.step_inner(session).await
+    }
+
+    /// Record a state transition on the session span, once per transition.
+    #[cfg(feature = "tracing")]
+    fn record_state<S: Session>(&mut self, session: &S) {
+        let state = alloc::format!("{:?}", session.state());
+        if self.recorded_state.as_deref() == Some(state.as_str()) {
+            return;
+        }
+        self.span.record("state", state.as_str());
+        if let Some(version) = session.negotiated_version() {
+            self.span.record("version", version.as_str());
+        }
+        self.span
+            .in_scope(|| tracing::info!(state = %state, "session state"));
+        self.recorded_state = Some(state);
+    }
+
+    async fn step_inner<S: Session>(&mut self, session: &mut S) -> Result<(), Error> {
         self.flush(session).await?;
         if session.state().is_closed() {
             self.transport.close().await;
@@ -409,8 +565,11 @@ impl<T: TextTransport> Driver<T> {
         match self.wait(deadline).await? {
             Wake::Text(text) => {
                 let inbound = session.handle_text(&text, (self.now)());
+                // Never the payload: a message body can carry a household's consumption,
+                // and the identifiers are enough to find the exchange in a capture.
                 crate::trace::event!(
                     debug,
+                    message_id = ?inbound.message_id,
                     kind = ?inbound.kind,
                     status = ?inbound.status,
                     violations = inbound.report.violations().len(),
@@ -418,10 +577,12 @@ impl<T: TextTransport> Driver<T> {
                 );
                 // A refusal is the thing an operator actually needs to see, and the rule
                 // identifier is what makes it greppable across a fleet.
-                if inbound.report.has_errors() {
+                if !inbound.accepted() {
                     crate::trace::event!(
                         warn,
+                        message_id = ?inbound.message_id,
                         kind = ?inbound.kind,
+                        status = ?inbound.status,
                         diagnostic = ?inbound.report.diagnostic_label(),
                         "refused an inbound message"
                     );
@@ -435,8 +596,14 @@ impl<T: TextTransport> Driver<T> {
                 self.last_ping = Some((self.now)());
                 self.transport.ping().await?;
             }
+            Wake::Alive => {}
             Wake::Closed => {
                 crate::trace::event!(info, "the transport closed");
+                session.transport_closed((self.now)());
+            }
+            Wake::Idle => {
+                crate::trace::event!(warn, "nothing heard from the peer within the idle limit");
+                self.transport.close().await;
                 session.transport_closed((self.now)());
             }
         }
@@ -498,16 +665,38 @@ impl<T: TextTransport> Driver<T> {
                 .unwrap_or(Duration::ZERO),
         };
 
-        let (sleep_for, wake) = if until_deadline <= until_ping {
-            (until_deadline, Wake::Timeout)
-        } else {
-            (until_ping, Wake::Ping)
+        let until_idle = match (self.idle_limit, self.last_heard) {
+            (None, _) => Duration::MAX,
+            // As with the ping, the first step starts the clock.
+            (Some(limit), None) => {
+                self.last_heard = Some(now);
+                limit
+            }
+            (Some(limit), Some(heard)) => limit
+                .checked_sub(now.saturating_duration_since(heard))
+                .unwrap_or(Duration::ZERO),
         };
 
+        let (sleep_for, wake) = [
+            (until_deadline, Wake::Timeout),
+            (until_ping, Wake::Ping),
+            (until_idle, Wake::Idle),
+        ]
+        .into_iter()
+        .min_by_key(|(after, _)| *after)
+        .unwrap_or((until_deadline, Wake::Timeout));
+
         tokio::select! {
-            frame = self.transport.recv_text() => match frame? {
-                Some(text) => Ok(Wake::Text(text)),
-                None => Ok(Wake::Closed),
+            frame = self.transport.recv() => {
+                let frame = frame?;
+                if frame.is_some() {
+                    self.last_heard = Some((self.now)());
+                }
+                Ok(match frame {
+                    Some(Received::Text(text)) => Wake::Text(text),
+                    Some(Received::Alive) => Wake::Alive,
+                    None => Wake::Closed,
+                })
             },
             () = tokio::time::sleep(core::time::Duration::from(sleep_for)) => Ok(wake),
         }
@@ -518,7 +707,9 @@ enum Wake {
     Text(String),
     Timeout,
     Ping,
+    Alive,
     Closed,
+    Idle,
 }
 
 #[cfg(test)]
@@ -588,6 +779,35 @@ mod tests {
         assert!(written[0].contains(r#""message_type":"Handshake""#));
         // And the CEM's handshake was answered.
         assert!(written.iter().any(|m| m.contains("ReceptionStatus")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_goes_silent_is_closed_rather_than_pinged_for_ever() {
+        // A half-open TCP connection answers nothing — not a message, not a pong. Without
+        // a limit the driver pings into it indefinitely and reconnection never starts.
+        let details = crate::testing::battery_details();
+        let mut rm = RmSession::new(RmConfig::default(), details);
+        rm.open(virtual_clock());
+        let transport = Scripted {
+            inbound: VecDeque::new(),
+            outbound: Vec::new(),
+            pings: 0,
+        };
+        let mut driver = Driver::new(transport)
+            .with_clock(virtual_clock)
+            .with_ping_interval(Duration::from_secs(1))
+            .with_idle_limit(Some(Duration::from_secs(3)));
+        for _ in 0..64 {
+            driver.step(&mut rm).await.unwrap();
+            if rm.state().is_closed() {
+                break;
+            }
+        }
+        assert!(
+            rm.state().is_closed(),
+            "silence past the limit must end the session"
+        );
+        assert!(driver.transport_mut().pings >= 2, "it was pinged first");
     }
 
     /// A transport that answers every `recv_text` after `gap`, for ever.

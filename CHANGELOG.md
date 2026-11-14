@@ -8,11 +8,90 @@ identifiers (`S2-FRBC-004`) and the `D`, `R`, `E` and `I` numbers cited from the
 their meaning, and a change to what a rule means gets a new identifier rather than a new
 definition.
 
-## [Unreleased]
+## [0.4.0] — 2026-11-14
 
-Nothing yet.
+Breaking. S2 Connect conformance, and per-session tracing.
 
-## [0.3.0] — unreleased
+### Breaking
+
+- **API versions are discovered, and URLs carry none.** `router` and `lan_router` serve
+  `GET /` → `["v1"]`. `Pairing::lan`/`wan`, `Session::new` and `LanClient::new` take the
+  endpoint's *unversioned* URL (`https://hub.local/`, not `…/v1/`) and read the index
+  first; a URL already ending in `v1/` is still used as given. New
+  `client::Error::NoCommonApiVersion`.
+- `PairingService::with_connection_details(ConnectionDetails)` →
+  `as_communication_server(CommunicationServer { initiate_session_url, ca })`. The access
+  token is now minted per pairing — **⚠️ every pairing previously received the same one**.
+- `TlsPolicy::PinnedCa(CertificateDer)` → `TlsPolicy::Pinned(Fingerprint)`;
+  `CapturedIdentity::root` is a `Fingerprint`. New `Paired::pin()`,
+  `Fingerprint::from_bytes`.
+- `Fingerprint::to_hex()` writes plain lowercase hex (`ab01…`), not colon-separated
+  capitals. `Fingerprint::parse` reads both.
+- `Store` is keyed by `PairingKey { local, remote }`: `paired(key)`, `pairings_of(local)`
+  (was `paired_with`), `set_tokens(key, …)`, `unpair(key)`, `pairing_for_token` (was
+  `node_for_token`), new `revoke(key)`; `pairing_token(node, now)` takes the time.
+  `PairedNode` gains `revoked` and `pin()`.
+- `websocket_router`'s handler receives a `PairingKey`, not a `NodeId`;
+  `SessionService::authorize_connection` and `confirm_access_token` return one.
+- `PairingService::finalize` returns `Finalized { paired, displaced }`.
+- `PairingClient::accept`'s deployment argument is how the *server* was reached, used only
+  when it omits its own; this node's deployment comes from its own endpoint description.
+  **⚠️ silent:** a LAN CEM pairing with a WAN RM through `Pairing::wan` used to take itself
+  for a WAN node.
+- `PairingServer::connection_details` and `accept_connection_details` take `now`, enforce
+  6A/6B, and refuse 6B details without a `SHA256` CA fingerprint.
+- `TextTransport` gains `recv` (with a default) and `io::Received`; `Driver` closes a
+  connection silent for `io::IDLE_LIMIT` (90 s) — **⚠️ silent**; `with_idle_limit(None)`
+  restores the old behaviour.
+- `Inbound` gains `message_id`; `Session` gains `negotiated_version()`.
+- `LONG_POLL_HOLD` is 20 s (was 25); an idle `waitForPairing` answers `204` (was `200 []`).
+- `LocalSubnets` no longer admits loopback unless `allowing_loopback()` — **⚠️ silent** for a
+  host serving its LAN routes on `127.0.0.1`.
+- Under S2 Connect an inbound `Handshake`/`HandshakeResponse` no longer renegotiates the wire
+  profile (D56).
+- With `std`, `Closed { reconnect_after }` is jittered as `S2C §Reconnection strategy`
+  prescribes, not the ceiling (D55).
+
+### Added
+
+- `SessionService::unpair_remote(key)` — a server-initiated unpair: live sessions end and
+  the next `initiateSession` is answered `NoLongerPaired`. `register_session`,
+  `live_sessions`, `end_sessions`, `LiveSession`, `ServerSocket::ending_with`. Unpairing by
+  either side, and re-pairing, now close the WebSocket (`S2C §Termination`).
+- `Memory::open_for_pairing_dynamic` / `open_for_pairing_until`; dynamic tokens expire
+  (`DYNAMIC_TOKEN_LIFETIME`, five minutes).
+- `ConnectionDetails::new`, `with_ca_fingerprint`, `ca_fingerprint`.
+- `SessionInitClient::allowing_insecure_websocket`, `WebSocketOptions::allow_insecure_bearer`
+  — test-only escapes from the new `wss://`-only rule.
+- `Driver::with_span` and per-session `tracing` spans: state, negotiated version, and each
+  refusal with its `message_id` and rule id — never a payload.
+- `WireProfile::ALL`. `server::{API_VERSIONS, MAX_CONNECTIONS, HANDSHAKE_TIMEOUT}`.
+
+### Security
+
+- `rustls` ≥ 0.23.46 (RUSTSEC-2026-0285, -0346, -0347); `ctutils` 0.4.8 in the lockfile
+  (RUSTSEC-2026-0385).
+
+### Fixed
+
+- A transient error during `initiateSession`/`confirmAccessToken` no longer wedges
+  `client::Session`; every failure but `NoLongerPaired` leaves it ready to retry.
+- The client's fifteen-second pairing budget is measured on the clock at each step.
+- `TokenStore` never evicts the token in force to make room for unconfirmed grants.
+- Session-initiation token rotation is atomic per pairing.
+- Malformed request bodies are `400 ParsingError`, not axum's `422`.
+- The TLS server bounds connections (256), handshakes and header reads (10 s).
+- Long-poll node entries expire after five minutes, so the table cannot be filled for good.
+
+### Changed
+
+- **Regenerating from the specifications:** `cargo xtask vendor-specs`,
+  `gen-model-reference`, `check-docs` and `interop` read the upstream S2 repositories
+  from `$S2_REFERENCE` — `s2-json/` (a full clone), `s2-connect/`, `s2-documentation/`,
+  and the interop peers under `implementations/`. Contributor tooling only; the crate is
+  unchanged.
+
+## [0.3.0] — 2026-09-13
 
 Breaking. A crypto-provider fix that changes what the `tokio` feature pulls in, and three
 API corrections that came out of `hems`'s report on 0.2.0.
@@ -221,7 +300,8 @@ First release. Implements **S2 JSON v1.0.0** and **S2 Connect 1.0.0**.
   own published examples. The fixtures are kept verbatim and the findings asserted by
   name.
 
-[Unreleased]: https://github.com/hupe1980/s2-kit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/hupe1980/s2-kit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hupe1980/s2-kit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/s2-kit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/s2-kit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/s2-kit/releases/tag/v0.1.0

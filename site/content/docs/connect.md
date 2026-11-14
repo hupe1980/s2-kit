@@ -1,6 +1,6 @@
 +++
 title = "S2 Connect"
-description = "Discovery, pairing and session initiation in s2-kit: the mutual HMAC challenge-response, why LAN trust runs backwards, the per-node rate limit, and the two-phase access token commit."
+description = "Discovery, pairing and session initiation in s2-kit: version discovery, the mutual HMAC challenge-response, why LAN trust runs backwards, per-pairing secrets, the two-phase access token commit, and what unpairing ends."
 weight = 40
 +++
 
@@ -19,6 +19,22 @@ becomes a WebSocket.
                     or postConnectionDetails   → websocketUrl + token
                     finalizePairing
 ```
+
+## URLs carry no version; the index does
+
+Every URL one endpoint gives another — a DNS-SD `pairingUrl`, a typed URL, the
+`initiateSessionUrl` from pairing — is **unversioned**: `https://EVSE1038.local/`, not
+`…/v1/`. The server answers `GET /` with the API versions it serves, and the client
+"**must** always first determine which version of the API it will use":
+
+```console
+$ curl -k https://EVSE1038.local/
+["v1"]
+```
+
+`router` and `lan_router` serve that index; the clients read it before their first
+operation and join everything below the version they chose. A URL that already ends in
+`v1/` — what older peers hand out — is used as given.
 
 ## Roles are not what you expect
 
@@ -57,10 +73,20 @@ pairing, whose entire purpose is finding out whether that server is the right on
 | Policy | Authenticates? | For |
 |---|---|---|
 | `Web` | yes, the platform's trust store | a WAN endpoint |
-| `PinnedCa` | yes, one certificate | every LAN connection *after* pairing |
+| `Pinned(fingerprint)` | yes, one certificate | every LAN connection *after* pairing |
 | `LanPairingOnly` | **no** | the four pairing requests, and nothing else |
 
 `Session::new` refuses the third outright.
+
+A pin is the SHA-256 fingerprint of the certificate, 32 bytes to persist beside the access
+token: `Paired::pin()` after a LAN pairing, or the `certificateFingerprint` a client posted
+when it is to be the communication server (6B). A handshake passes when the leaf *is* the
+pinned certificate, or when a certificate in the presented chain is and the leaf validates
+against it — so a server that leaves its root out of the chain still connects.
+
+Fingerprints go on the wire as the specification encodes them, plain lowercase
+hexadecimal; one written with colons is still read. And they are the **CA's**: the HMAC
+binds the leaf, `certificateFingerprint` names the CA ([erratum E19](@/docs/errata.md)).
 
 ## The exchange is mutual, and a round trip apart
 
@@ -93,6 +119,25 @@ one reachable request is enough to attack the token offline. A four-character dy
 token is 14.7 million candidates, which is seconds of GPU time. Prefer longer tokens than
 the minimum; this is recorded as [erratum E18](@/docs/errata.md).
 
+## One secret per pairing
+
+The access token pairing hands out is generated **per pairing**, from the operating
+system's CSPRNG — `S2C §8A` says it "**must**". So the host gives `PairingService` only
+where to connect and which CA it uses; the token is minted for each client:
+
+```rust,ignore
+let pairing = PairingService::lan(store, endpoint, identity.leaf)
+    .as_communication_server(CommunicationServer {
+        initiate_session_url: "https://hub.local/".into(), // no version
+        ca: Fingerprint::of(&identity.ca),
+    });
+```
+
+Pairings are stored under a `PairingKey { local, remote }`. Both halves, because "a CEM
+can be paired with multiple RMs at the same time", and a WAN endpoint hosting a household's
+battery and heat pump holds two pairings with one CEM: keyed by either half alone, one of
+them silently overwrites the other.
+
 ## Session initiation is a two-phase commit
 
 An access token is valid **one time**. A naive exchange — present it, server burns it and
@@ -110,7 +155,9 @@ for. Nobody has to re-pair the devices by hand.
 
 The confirmation has its own deadline of fifteen seconds. A late one is refused and
 changes nothing, so the token the client still holds keeps working: a slow network is a
-retry, not an unpairing.
+retry, not an unpairing. Neither is any other failure: `Session::initiate` is ready for
+the next attempt after every error, with `Session::backoff` saying how long to wait —
+except `NoLongerPaired`, which means a person has to pair the devices again.
 
 ## The last mile: a token the server keeps
 
@@ -126,8 +173,8 @@ use s2_kit::connect::server::websocket_router;
 use s2_kit::io::Driver;
 use s2_kit::prelude::*;
 
-let ws = websocket_router(endpoint.clone(), "/s2", |node, socket| async move {
-    // `node` is the paired peer the token belonged to: which resource this is.
+let ws = websocket_router(endpoint.clone(), "/s2", |pairing, socket| async move {
+    // `pairing.remote` is the paired peer the token belonged to: which resource this is.
     let mut cem = CemSession::new(CemConfig::default().pre_negotiated(WireProfile::V1_0_0));
     cem.open(Timestamp::now());
     let _ = Driver::new(socket).run(&mut cem, |_event, _session| {}).await;
@@ -137,6 +184,28 @@ let app = lan_router(endpoint, subnets).merge(ws);
 
 `ServerSocket` is an `io::TextTransport`, the same trait the client's `io::WebSocket`
 implements, so the driver does not care which end of the connection it is on.
+
+The token travels only over `wss://`: the client refuses a `ws://` `websocketUrl`, and the
+dialler refuses to put a bearer on a plaintext socket — "S2 **MUST NOT** be sent over
+unencrypted channels". A loopback test opts in explicitly
+(`WebSocketOptions::allow_insecure_bearer`).
+
+## Unpairing ends the session, now
+
+"After two nodes have unpaired, the S2 WebSocket connection **MUST** be terminated
+immediately." `websocket_router` registers every socket it accepts, and every way a
+pairing ends closes it:
+
+- the client calls `unpair`;
+- the host calls `SessionService::unpair_remote(key)` — which also answers the next
+  `initiateSession` with `NoLongerPaired`, once, so the peer knows to stop retrying;
+- a pairing is replaced: the same two nodes pair again, or a Resource Manager pairs with a
+  new CEM ("A RM can only be paired with one CEM at a time").
+
+A connection can also simply die. The driver pings every thirty seconds and closes a
+connection it has heard nothing from — no message, no pong — for ninety, so a half-open
+TCP link becomes a `Closed` event with a reconnection hint, drawn as the specification's
+`random(0, min(600 s, 2 s × 2ⁿ))` so a fleet does not come back in lockstep.
 
 On the client side, dial with the policy pairing produced:
 
@@ -163,7 +232,7 @@ WebSocket at all, so it should not have to opt *out* of serving one.
 | Builder | Serves | Needs |
 |---|---|---|
 | `router(endpoint)` | the authenticated pairing and session-initiation operations | nothing |
-| `lan_router(endpoint, subnets)` | those **plus** the LAN-only ones, behind the subnet check | `LocalSubnets` |
+| `lan_router(endpoint, subnets)` | those **plus** the LAN-only ones, behind the subnet check | `LocalSubnets` — loopback excluded unless `allowing_loopback()`, since behind a reverse proxy every request comes from `127.0.0.1` |
 | `websocket_router(endpoint, path, handler)` | the S2 WebSocket, behind the communication token | a handler |
 
 A WAN endpoint mounts `router` and the absent routes answer `404`, which is what the
@@ -175,8 +244,9 @@ not one of the available mistakes.
 
 S2 Connect expects some RMs to be "purely an HTTPS client" — no listening socket, nothing
 to connect to. Pairing cannot start by somebody dialling them, so they dial out and wait:
-`POST /v1/waitForPairing` is held open by the other endpoint for up to twenty-five seconds
-and answered the moment there is something to say.
+`POST /v1/waitForPairing` is held open by the other endpoint for twenty seconds — inside
+the twenty-five the specification allows — and answered the moment there is something to
+say, or with `204` when there is not.
 
 ```rust,ignore
 // On the device with no server:
@@ -192,7 +262,7 @@ loop {
 endpoint.instruct_waiting_node(node, WaitAction::RequestPairing);
 ```
 
-An empty answer is "nothing yet, ask again", not a failure, and a queued instruction wakes
+`204` is "nothing yet, ask again", not a failure, and a queued instruction wakes
 a waiting request rather than letting it run out the hold. `Endpoint::waiting_nodes` is
 what a user interface lists — the counterpart of `GET /v1/nodes` for clients with no
 server to browse.
@@ -228,5 +298,5 @@ $ cargo run --example connect_pair --features connect-client,connect-server
 ```
 
 That pairs a charger with a hub over a real TLS connection on loopback, then initiates two
-sessions — including the mandatory second, the certificate pinning, and the token
-rotation.
+sessions — including the version index, the mandatory second, the certificate pinning, and
+the token rotation.

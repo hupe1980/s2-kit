@@ -184,10 +184,22 @@ fn the_vendored_tree_says_whose_it_is_and_where_it_came_from() {
         "the README must name the upstream repository"
     );
     // The revision, so "this is upstream's" is a checkable claim rather than an assertion.
-    let revision = readme
+    // From a release tag, never a moving branch: `vendor-specs` reads git objects at the
+    // tag, so the vendored files are the version the crate claims to speak.
+    let line = readme
         .lines()
-        .find_map(|line| line.strip_prefix("Vendored from revision `"))
-        .and_then(|rest| rest.split('`').next())
+        .find_map(|line| line.strip_prefix("Vendored from tag `"))
+        .expect("the README must record the upstream tag and revision");
+    let tag = line.split('`').next().unwrap_or_default();
+    assert!(
+        s2_kit::types::ProtocolVersion::from(tag)
+            .wire_profile()
+            .is_some(),
+        "vendored from {tag:?}, which is no wire profile this crate speaks"
+    );
+    let revision = line
+        .split_once("commit `")
+        .and_then(|(_, rest)| rest.split('`').next())
         .expect("the README must record the upstream revision");
     assert_eq!(revision.len(), 40, "a full git object id, not {revision:?}");
     assert!(

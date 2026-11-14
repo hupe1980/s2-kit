@@ -6,8 +6,8 @@
 
 **⚡ The S2 energy flexibility standard in Rust.**
 
-S2 — formally **EN 50491-12-2**, becoming IEC 63402-2 — is the European standard for
-communicating energy flexibility between a **Customer Energy Manager** (CEM) and a
+S2 — formally **EN 50491-12-2**, internationally IEC 63402-2-2 — is the European standard
+for communicating energy flexibility between a **Customer Energy Manager** (CEM) and a
 **Resource Manager** (RM). A battery, an EV charger, a heat pump or a PV inverter
 describes *how* it can behave; the energy manager decides *why* it should. The standard's
 own image is a menu: the resource writes it, the manager orders from it, and the resource
@@ -142,12 +142,13 @@ answers the only question an event loop has: when must I next wake, and for whom
 session keeps the counters an operator asks for too — refusals, nacks, ack timeouts, and
 the *slowest* acknowledgement, not just the mean.
 
-**🤝 S2 Connect end to end.** Discovery over DNS-SD, the mutual challenge–response bound to
-the server's certificate, the per-node rate limit and mandatory delay *in the state
-machine* rather than in a request handler, the two-phase token commit with both its expiry
-windows, long-polling for the Resource Manager nobody can dial, and an `axum` endpoint that
-ends where the specification does: a WebSocket the communication token opens, once. All of
-it tested over a real TLS connection on loopback.
+**🤝 S2 Connect end to end.** Discovery over DNS-SD, API version discovery, the mutual
+challenge–response bound to the server's certificate, the per-node rate limit and
+mandatory delay *in the state machine* rather than in a request handler, a fresh access
+token for every pairing, the two-phase token commit with both its expiry windows,
+long-polling for the Resource Manager nobody can dial, and an `axum` endpoint that ends
+where the specification does: a WebSocket the communication token opens, once — and that
+unpairing closes. All of it tested over a real TLS connection on loopback.
 
 **🔐 Your application's TLS backend, not ours.** `s2-kit` never installs a `rustls` crypto
 provider over one the application already chose. If you have not chosen, it bundles one:
@@ -207,7 +208,7 @@ with `==` is a pairing that fails between two implementations that speak the sam
 | `tls-aws-lc-rs` | 🔐 `aws-lc-rs` instead: rustls's own default, FIPS-certifiable, post-quantum key exchange — at the cost of a vendored BoringSSL and a `cmake` build. |
 | `jiff` / `time` / `chrono` | `Timestamp` conversions, with the crate re-exported. |
 | `testing` | Fixtures, the two-engine harness, and `.s2log` transcripts read as well as written. |
-| `tracing` | Structured events from the drivers: what crossed the wire, and what was refused. |
+| `tracing` | A span per session (state, negotiated version) and an event per message, keyed by `message_id`: a refusal in a fleet's logs leads to the exchange and the rule. Never a payload. |
 | `schemars` | `JsonSchema` for this crate's own types. |
 | `cli` | The `s2-kit` command-line tool. |
 
@@ -246,10 +247,11 @@ S2 Connect from DNS-SD through pairing to an authorised WebSocket. Pre-1.0, so a
 may break the API; rule identifiers and the errata numbers cited from the code do not
 change meaning.
 
-Verified on every commit: **384 tests** (202 of them under `no_std`), zero clippy warnings
-at `pedantic` on every configuration built, the feature powerset to depth 2, `wasm32`,
-`thumbv7em` and `riscv32imac` builds, rustdoc with warnings denied, `cargo deny`, and
-seven fuzz targets nightly.
+Verified on every commit: the whole suite (`cargo test --all-features`, and the unit tests
+again under `no_std`), zero clippy warnings at `pedantic` on every configuration built, the
+feature powerset to depth 2, `wasm32`, `thumbv7em` and `riscv32imac` builds, rustdoc with
+warnings denied, `cargo deny` and `cargo semver-checks`. Seven fuzz targets run locally
+with `cargo +nightly fuzz`.
 
 * 📐 **The model is the schema.** One instance of every message, with every optional field
   set, validated by a real JSON Schema validator against the vendored official files — and

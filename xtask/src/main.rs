@@ -189,10 +189,17 @@ fn check_upstream_tags(specs: &Path) -> Result<()> {
         );
     }
     let tags = String::from_utf8_lossy(&output.stdout);
+    // Tags older than the oldest profile predate what this crate speaks (`v0.0.1-beta`).
+    let oldest = s2_kit::types::WireProfile::ALL
+        .iter()
+        .filter_map(|p| version_order(p.connect_version_str()))
+        .min()
+        .context("a wire profile with an unparseable version")?;
     let unknown: Vec<&str> = tags
         .lines()
         .map(str::trim)
         .filter(|t| !t.is_empty())
+        .filter(|t| version_order(t).is_none_or(|v| v >= oldest))
         .filter(|t| {
             s2_kit::types::ProtocolVersion::from(*t)
                 .wire_profile()
@@ -216,6 +223,22 @@ fn check_upstream_tags(specs: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `v1.2.3[-pre]` as a sortable key; a pre-release sorts before its release.
+fn version_order(tag: &str) -> Option<(u64, u64, u64, bool)> {
+    let tag = tag.strip_prefix('v').unwrap_or(tag);
+    let (core, pre) = tag.split_once('-').map_or((tag, false), |(c, _)| (c, true));
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let (major, minor, patch) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, !pre))
 }
 
 /// The bytes of `path` at `tag`. A shallow clone has no tags, so says so.
